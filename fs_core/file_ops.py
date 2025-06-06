@@ -692,3 +692,85 @@ def read_file(
         f"{len(final_read_data)} bytes read successfully from fd {fd}.",
         final_read_data,
     )
+
+
+def create_symbolic_link(
+    dm: DiskManager,
+    current_user_uid: int,
+    parent_inode_id: int,
+    link_name: str,
+    target_path: str,
+) -> Tuple[bool, str, Optional[int]]:
+    """
+    在指定的父目录下创建一个新的符号链接。
+
+    Args:
+        dm: DiskManager 实例。
+        current_user_uid: 当前用户的UID。
+        parent_inode_id: 链接所在的父目录的i节点ID。
+        link_name: 新符号链接的名称。
+        target_path: 符号链接指向的目标路径字符串。
+    """
+    # 1. 基本名称验证
+    if not link_name or "/" in link_name or link_name in [".", ".."]:
+        return False, f"错误：无效的链接名称 '{link_name}'。", None
+
+    # 2. 检查父目录下是否已存在同名文件/目录
+    parent_entries = _read_directory_entries(dm, parent_inode_id)
+    if parent_entries is None:
+        return False, f"错误：无法读取父目录 (inode {parent_inode_id}) 的条目。", None
+
+    if any(entry.name == link_name for entry in parent_entries):
+        return False, f"错误：名称 '{link_name}' 已在当前目录中存在。", None
+
+    # --- 开始分配资源 ---
+    # 3. 为新链接分配i节点
+    new_inode_id = dm.allocate_inode(uid_for_inode=current_user_uid)
+    if new_inode_id is None:
+        return False, "错误：没有可用的i节点。", None
+
+    # 4. 初始化链接的i节点
+    current_timestamp = int(time.time())
+    # 符号链接的权限通常很开放 (lrwxrwxrwx -> 0o777)
+    link_inode = Inode(
+        inode_id=new_inode_id,
+        file_type=FileType.SYMBOLIC_LINK,
+        owner_uid=current_user_uid,
+        permissions=0o777,
+    )
+    link_inode.link_count = 1
+
+    # 5. 将目标路径写入数据块
+    target_path_bytes = target_path.encode("utf-8")
+    link_inode.size = len(target_path_bytes)  # 链接文件的大小是其路径字符串的长度
+
+    if link_inode.size > 0:
+        # 分配一个数据块来存储路径
+        block_id = dm.allocate_data_block()
+        if block_id is None:
+            dm.free_inode(new_inode_id)
+            return False, "错误：没有可用的数据块来存储链接目标。", None
+
+        dm.write_block(block_id, target_path_bytes)
+        link_inode.data_block_indices.append(block_id)
+        link_inode.blocks_count = 1
+
+    link_inode.atime = link_inode.mtime = link_inode.ctime = current_timestamp
+    dm.inode_table[new_inode_id] = link_inode
+
+    # 6. 在父目录中添加新链接的条目
+    new_entry = DirectoryEntry(name=link_name, inode_id=new_inode_id)
+    parent_entries.append(new_entry)
+
+    if not _write_directory_entries(dm, parent_inode_id, parent_entries):
+        # 回滚
+        if link_inode.data_block_indices:
+            dm.free_data_block(link_inode.data_block_indices[0])
+        dm.free_inode(new_inode_id)
+        return False, f"错误：更新父目录 (inode {parent_inode_id}) 失败。", None
+
+    parent_inode = dm.get_inode(parent_inode_id)
+    if parent_inode:
+        parent_inode.mtime = parent_inode.ctime = current_timestamp
+
+    return True, f"符号链接 '{link_name}' -> '{target_path}' 创建成功。", new_inode_id

@@ -23,43 +23,35 @@ from PyQt6.QtWidgets import (
     QAbstractItemView,
 )
 from PyQt6.QtGui import QAction, QStandardItemModel, QStandardItem, QIcon, QKeySequence
-from PyQt6.QtCore import (
-    Qt,
-    QSize,
-    QModelIndex,
-    QPoint,
-    QItemSelectionModel,
-)  # 确保 QItemSelectionModel 导入
+from PyQt6.QtCore import Qt, QModelIndex, QPoint, QItemSelectionModel
 
-# 从您的项目中导入
+# Backend Imports
 from fs_core.dir_ops import (
     list_directory,
     make_directory,
     remove_directory,
     rename_item,
-    _resolve_path_to_inode_id,  # 确保导入 _resolve_path_to_inode_id
+    _resolve_path_to_inode_id,
 )
-from fs_core.file_ops import create_file, delete_file
-from fs_core.datastructures import (
-    FileType,
-    DirectoryEntry,
-)
-
+from fs_core.file_ops import create_file, delete_file, create_symbolic_link
+from fs_core.datastructures import FileType
 from fs_core.fs_utils import get_inode_path_str
-from user_management.user_auth import ROOT_UID  # 导入 ROOT_UID
+from user_management.user_auth import ROOT_UID
 
+# GUI Component Imports
 from .text_editor_dialog import TextEditorDialog
 from .properties_dialog import PropertiesDialog
 
-# 为自定义数据角色定义常量
+# Custom Data Roles
 INODE_ID_ROLE = Qt.ItemDataRole.UserRole
 IS_DIR_ROLE = Qt.ItemDataRole.UserRole + 1
 TYPE_STR_ROLE = Qt.ItemDataRole.UserRole + 2
 CHILDREN_LOADED_ROLE = Qt.ItemDataRole.UserRole + 3
 
 
-# 新增：用于自定义排序的QStandardItem子类
 class SortableStandardItem(QStandardItem):
+    """A QStandardItem subclass that allows sorting by a custom key."""
+
     def __init__(self, display_text="", sort_key_data=None):
         super().__init__(display_text)
         self.sort_key = sort_key_data if sort_key_data is not None else display_text
@@ -75,7 +67,7 @@ class SortableStandardItem(QStandardItem):
                     return False
                 return self.sort_key < other.sort_key
             except TypeError:
-                # 回退到 QStandardItem 的默认比较 (基于文本)
+                # Fallback to QStandardItem's default comparison (text-based)
                 return super().__lt__(other)
         return super().__lt__(other)
 
@@ -95,18 +87,7 @@ class MainWindow(QMainWindow):
         current_user = self.user_auth.get_current_user()
         username = current_user.username if current_user else "N/A"
         self.current_cwd_inode_id = self.user_auth.get_cwd_inode_id()
-        initial_path_str = "/"
-        if (
-            self.current_cwd_inode_id is not None
-            and self.disk_manager
-            and self.disk_manager.is_formatted
-            and self.disk_manager.superblock
-        ):
-            initial_path_str = get_inode_path_str(
-                self.disk_manager, self.current_cwd_inode_id
-            )
-        else:
-            initial_path_str = "[Uninitialized Path]"
+        self.address_bar = QLineEdit()  # Moved here to be accessible earlier
 
         self.setWindowTitle(f"模拟文件系统 - 用户: {username}")
         self.setGeometry(100, 100, 900, 600)
@@ -114,17 +95,19 @@ class MainWindow(QMainWindow):
         self._create_base_actions()
         self._create_menus()
         self._create_status_bar()
+        self._setup_central_widget()
 
+        self._initialize_views()
+
+    def _setup_central_widget(self):
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QVBoxLayout(central_widget)
 
-        self.address_bar = QLineEdit(initial_path_str)
-        self.address_bar.setReadOnly(True)
         main_layout.addWidget(self.address_bar)
+        self.address_bar.setReadOnly(True)
 
         self.splitter = QSplitter(Qt.Orientation.Horizontal)
-
         self.dir_tree_view = QTreeView()
         self.dir_tree_model = QStandardItemModel()
         self.dir_tree_view.setModel(self.dir_tree_model)
@@ -158,13 +141,15 @@ class MainWindow(QMainWindow):
         self.splitter.addWidget(self.file_list_view)
 
         self.splitter.setSizes([250, 650])
-        self.dir_tree_view.setSizePolicy(
-            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding
-        )
-        self.file_list_view.setSizePolicy(
-            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
-        )
         main_layout.addWidget(self.splitter)
+
+    def _initialize_views(self):
+        initial_path_str = (
+            get_inode_path_str(self.disk_manager, self.current_cwd_inode_id)
+            if self.current_cwd_inode_id is not None
+            else "[Uninitialized]"
+        )
+        self.address_bar.setText(initial_path_str)
 
         if (
             self.disk_manager
@@ -182,39 +167,30 @@ class MainWindow(QMainWindow):
             self.dir_tree_model.appendRow(root_item)
             self._populate_children_in_tree(root_item, root_inode_id)
             self.dir_tree_view.expand(root_item.index())
-            self._populate_file_list_view(
-                self.current_cwd_inode_id
-                if self.current_cwd_inode_id is not None
-                else root_inode_id
-            )  # 使用 CWD 或 root
-            self._update_go_up_action_state()
+            self._refresh_current_views()
             if self.file_list_model.rowCount() > 0:
                 self.file_list_view.sortByColumn(0, Qt.SortOrder.AscendingOrder)
         else:
             self.status_bar.showMessage("错误：磁盘未格式化或无法访问根目录", 5000)
-            self._update_go_up_action_state()  # 即使出错也更新，确保禁用
 
+        self._update_go_up_action_state()
+
+    # ICON METHODS
     def _get_folder_icon(self) -> QIcon:
-        icon = QIcon.fromTheme("folder", QIcon.fromTheme("inode-directory"))
-        if icon.isNull():
-            style = self.style()
-            icon = (
-                style.standardIcon(style.StandardPixmap.SP_DirIcon)
-                if style
-                else QIcon()
-            )
+        icon = QIcon.fromTheme(
+            "folder-open",
+            self.style().standardIcon(QStyle.StandardPixmap.SP_DirOpenIcon),
+        )
         return icon
 
     def _get_file_icon(self) -> QIcon:
-        icon = QIcon.fromTheme("text-x-generic", QIcon.fromTheme("document-default"))
-        if icon.isNull():
-            style = self.style()
-            icon = (
-                style.standardIcon(style.StandardPixmap.SP_FileIcon)
-                if style
-                else QIcon()
-            )
+        icon = QIcon.fromTheme(
+            "text-plain", self.style().standardIcon(QStyle.StandardPixmap.SP_FileIcon)
+        )
         return icon
+
+    def _get_symlink_icon(self) -> QIcon:
+        return self.style().standardIcon(QStyle.StandardPixmap.SP_FileLinkIcon)
 
     def _add_directory_to_tree(
         self, parent_item: QStandardItem, dir_name: str, inode_id: int
@@ -224,53 +200,35 @@ class MainWindow(QMainWindow):
         item.setEditable(False)
         item.setData(inode_id, INODE_ID_ROLE)
         item.setData(True, IS_DIR_ROLE)
-        item.setData(False, CHILDREN_LOADED_ROLE)  # Initially not loaded
+        item.setData(False, CHILDREN_LOADED_ROLE)
         parent_item.appendRow(item)
-        # Add a placeholder item if this directory itself might have children,
-        # to ensure the expander arrow is shown.
         placeholder_item = QStandardItem()
         item.appendRow(placeholder_item)
-        return item
 
     def _populate_children_in_tree(
         self, parent_q_item: QStandardItem, parent_inode_id: int
     ):
         if not self.disk_manager or not self.user_auth:
             return
-
-        parent_q_item.removeRows(
-            0, parent_q_item.rowCount()
-        )  # Clear existing children (like placeholder)
+        parent_q_item.removeRows(0, parent_q_item.rowCount())
         success, _, entries = list_directory(self.disk_manager, parent_inode_id)
-
         if not success or entries is None:
-            parent_q_item.setData(
-                True, CHILDREN_LOADED_ROLE
-            )  # Mark as attempted to load
+            parent_q_item.setData(True, CHILDREN_LOADED_ROLE)
             return
-
         entries.sort(
             key=lambda x: (
                 x.get("type") != FileType.DIRECTORY.name,
                 x.get("name", "").lower(),
             )
         )
-
-        has_dirs_to_add = False
         for entry in entries:
-            if entry.get("type") == FileType.DIRECTORY.name:
-                if entry.get("name") in [".", ".."]:
-                    continue
+            if entry.get("type") == FileType.DIRECTORY.name and entry.get(
+                "name"
+            ) not in [".", ".."]:
                 self._add_directory_to_tree(
                     parent_q_item, entry.get("name"), entry.get("inode_id")
                 )
-                has_dirs_to_add = True
-
         parent_q_item.setData(True, CHILDREN_LOADED_ROLE)
-        # If no actual subdirectories were added, and it's a directory,
-        # it might still need a placeholder if we want to differentiate visually
-        # between "expanded but empty" and "not yet expanded".
-        # However, the current logic in _add_directory_to_tree already adds placeholder for each dir.
 
     def on_tree_item_expanded(self, index: QModelIndex):
         if not index.isValid():
@@ -278,9 +236,6 @@ class MainWindow(QMainWindow):
         item_being_expanded = self.dir_tree_model.itemFromIndex(index)
         if not item_being_expanded:
             return
-
-        # Check if children are already loaded or if it's a placeholder
-        # The CHILDREN_LOADED_ROLE helps distinguish actual loading from just having a placeholder
         if not item_being_expanded.data(CHILDREN_LOADED_ROLE):
             item_inode_id = item_being_expanded.data(INODE_ID_ROLE)
             if item_inode_id is not None:
@@ -291,91 +246,136 @@ class MainWindow(QMainWindow):
             return
         item_inode_id = index.data(INODE_ID_ROLE)
         item_is_dir = index.data(IS_DIR_ROLE)
-
         if item_inode_id is not None and item_is_dir:
             self.current_cwd_inode_id = item_inode_id
             self.user_auth.set_cwd_inode_id(item_inode_id)
-            self.address_bar.setText(
-                get_inode_path_str(self.disk_manager, item_inode_id)
-            )
-            self._populate_file_list_view(item_inode_id)
-            self._update_go_up_action_state()
+            self._refresh_current_views()
 
     def on_item_double_clicked_in_list_view(self, index: QModelIndex):
         if not index.isValid():
             return
 
-        name_column_model_index = self.file_list_model.index(index.row(), 0)
-        item_inode_id = self.file_list_model.data(
-            name_column_model_index, INODE_ID_ROLE
-        )
-        item_is_dir = self.file_list_model.data(name_column_model_index, IS_DIR_ROLE)
-        item_name = self.file_list_model.data(
-            name_column_model_index, Qt.ItemDataRole.DisplayRole
-        )
+        name_col_idx = self.file_list_model.index(index.row(), 0)
+        item_inode_id = self.file_list_model.data(name_col_idx, INODE_ID_ROLE)
+        item_type_str = self.file_list_model.data(name_col_idx, TYPE_STR_ROLE)
+        item_name = self.file_list_model.data(name_col_idx, Qt.ItemDataRole.DisplayRole)
+        item_is_dir = self.file_list_model.data(name_col_idx, IS_DIR_ROLE)
 
         if item_inode_id is None or item_name is None:
+            return
+
+        if item_type_str == FileType.SYMBOLIC_LINK.name:
+            # Construct the absolute path of the link itself to resolve it
+            current_path = get_inode_path_str(
+                self.disk_manager, self.current_cwd_inode_id
+            )
+            link_full_path = (
+                f"{current_path}/{item_name}"
+                if current_path != "/"
+                else f"/{item_name}"
+            )
+
+            resolved_inode_id = _resolve_path_to_inode_id(
+                self.disk_manager,
+                self.current_cwd_inode_id,
+                self.disk_manager.superblock.root_inode_id,
+                link_full_path,
+            )
+
+            if resolved_inode_id is None:
+                QMessageBox.warning(
+                    self, "链接无效", f"符号链接 '{item_name}' 指向的目标不存在或无效。"
+                )
+                return
+
+            target_inode = self.disk_manager.get_inode(resolved_inode_id)
+            if not target_inode:
+                QMessageBox.warning(self, "链接无效", "无法获取链接目标的信息。")
+                return
+
+            if target_inode.type == FileType.DIRECTORY:
+                # If link target is a directory, navigate to it
+                self.current_cwd_inode_id = resolved_inode_id
+                self.user_auth.set_cwd_inode_id(resolved_inode_id)
+                self._refresh_current_views()
+                self._expand_and_select_in_tree(resolved_inode_id)
+            else:  # Link target is a file
+                self._open_file_by_inode(resolved_inode_id)
             return
 
         if item_is_dir:
             self.current_cwd_inode_id = item_inode_id
             self.user_auth.set_cwd_inode_id(item_inode_id)
-            current_path_str = get_inode_path_str(self.disk_manager, item_inode_id)
-            self.address_bar.setText(current_path_str)
-            self._populate_file_list_view(item_inode_id)
-            self._update_go_up_action_state()
+            self._refresh_current_views()
             self._expand_and_select_in_tree(item_inode_id)
-        else:
-            is_text_file = any(
-                item_name.lower().endswith(ext)
-                for ext in [".txt", ".py", ".md", ".json", ".csv", ".log"]
+        else:  # Regular file
+            self._open_file_by_inode(item_inode_id, item_name)
+
+    def _open_file_by_inode(self, inode_id: int, name_hint: Optional[str] = None):
+        """
+        辅助函数：当已知文件的inode时，打开该文件。
+        """
+        target_inode = self.disk_manager.get_inode(inode_id)
+        if not target_inode:
+            QMessageBox.critical(self, "错误", f"无法找到inode {inode_id}。")
+            return
+
+        # --- BUG修复 ---
+        # 错误：直接用文件的inode ID无法解析路径，因为它没有".."条目。
+        # 正确做法：获取当前工作目录（即文件的父目录）的路径，然后追加文件名。
+        parent_path = get_inode_path_str(self.disk_manager, self.current_cwd_inode_id)
+        if parent_path.startswith("[Error"):
+            QMessageBox.critical(self, "错误", f"无法解析父目录路径以打开文件。")
+            return
+
+        # 如果没有从UI获得文件名提示，则需要反向在父目录中查找（这会比较低效，但更健壮）
+        file_name = name_hint
+        if not file_name:
+            parent_entries = (
+                list_directory(self.disk_manager, self.current_cwd_inode_id)[2] or []
             )
-            if is_text_file:
-                parent_path_for_file = get_inode_path_str(
-                    self.disk_manager, self.current_cwd_inode_id
-                )
-                if parent_path_for_file.startswith("[Error"):
-                    QMessageBox.critical(
-                        self, "错误", f"无法确定父目录路径以打开 '{item_name}'。"
-                    )
-                    return
-                file_path_str = (
-                    f"/{item_name}"
-                    if parent_path_for_file == "/"
-                    else f"{parent_path_for_file}/{item_name}"
-                )
-                editor_dialog = TextEditorDialog(
-                    self.disk_manager,
-                    self.user_auth,
-                    self.pm,
-                    file_path_str,
-                    item_name,
-                    self,
-                )
-                editor_dialog.exec()
-                self._refresh_current_views()  # Refresh in case file content (size) changed
+            found_entry = next(
+                (e for e in parent_entries if e.get("inode_id") == inode_id), None
+            )
+            if found_entry:
+                file_name = found_entry.get("name")
             else:
-                self._gui_action_show_properties(item_inode_id_to_show=item_inode_id)
+                QMessageBox.critical(
+                    self, "错误", f"在当前目录中找不到inode {inode_id}对应的文件名。"
+                )
+                return
+
+        # 构造文件的完整路径
+        file_path = (
+            f"{parent_path}/{file_name}" if parent_path != "/" else f"/{file_name}"
+        )
+        # --- 修复结束 ---
+
+        # 检查是否是文本文件并使用编辑器打开
+        is_text = any(
+            file_name.lower().endswith(ext)
+            for ext in [".txt", ".py", ".md", ".json", ".csv", ".log"]
+        )
+        if is_text:
+            editor = TextEditorDialog(
+                self.disk_manager, self.user_auth, self.pm, file_path, file_name, self
+            )
+            editor.exec()
+            self._refresh_current_views()  # 刷新视图以防文件大小等属性被修改
+        else:
+            # 对于非文本文件，显示其属性
+            self._gui_action_show_properties(item_inode_id_to_show=inode_id)
 
     def _expand_and_select_in_tree(self, target_inode_id: int):
-        # Placeholder - robust implementation is complex
-        print(f"Placeholder: _expand_and_select_in_tree for inode {target_inode_id}")
         # A simple approach to select if visible and expand:
         root = self.dir_tree_model.invisibleRootItem()
-        indices_to_check = [root.index()]
-
-        # BFS or DFS to find the item
-        queue = [
-            self.dir_tree_model.item(i) for i in range(self.dir_tree_model.rowCount())
-        ]
         found_item = None
-
-        path_items = []  # To store path from root to found_item
+        path_items = []
 
         def find_item_recursive(parent_item, target_id):
             nonlocal found_item, path_items
             if found_item:
-                return True  # Already found
+                return True
 
             for row in range(parent_item.rowCount()):
                 current_item = parent_item.child(row, 0)
@@ -387,18 +387,14 @@ class MainWindow(QMainWindow):
                     found_item = current_item
                     return True
 
-                if current_item.data(IS_DIR_ROLE):  # Only recurse into directories
-                    # If children not loaded, expanding it will load them via on_tree_item_expanded
-                    # self.dir_tree_view.expand(current_item.index()) # Might trigger loading
+                if current_item.data(IS_DIR_ROLE):
                     if find_item_recursive(current_item, target_id):
                         return True
-                path_items.pop()  # Backtrack
+                path_items.pop()
             return False
 
         if self.dir_tree_model.rowCount() > 0:
-            root_gui_item = self.dir_tree_model.item(
-                0
-            )  # Assuming single root item ("/")
+            root_gui_item = self.dir_tree_model.item(0)
             path_items.append(root_gui_item)
             if root_gui_item.data(INODE_ID_ROLE) == target_inode_id:
                 found_item = root_gui_item
@@ -406,14 +402,9 @@ class MainWindow(QMainWindow):
                 find_item_recursive(root_gui_item, target_inode_id)
 
         if found_item:
-            # Expand all parents in the path
-            for item_in_path in path_items[
-                :-1
-            ]:  # Exclude the target item itself for expansion
+            for item_in_path in path_items[:-1]:
                 if item_in_path and item_in_path.index().isValid():
                     self.dir_tree_view.expand(item_in_path.index())
-
-            # Select the target item
             self.dir_tree_view.setCurrentIndex(found_item.index())
             self.dir_tree_view.scrollTo(
                 found_item.index(), QAbstractItemView.ScrollHint.PositionAtCenter
@@ -421,89 +412,108 @@ class MainWindow(QMainWindow):
 
     def _populate_file_list_view(self, dir_inode_id: int):
         self.file_list_model.setRowCount(0)
-        self.status_bar.showMessage(
-            f"正在加载目录 inode {dir_inode_id} 的内容...", 2000
-        )
-        success, msg_ls_unused, entries = list_directory(
-            self.disk_manager, dir_inode_id
-        )
+        self.status_bar.showMessage(f"正在加载目录 inode {dir_inode_id}...", 1000)
+        success, _, entries = list_directory(self.disk_manager, dir_inode_id)
         if not success or entries is None:
-            self.status_bar.showMessage(
-                f"无法读取目录 inode {dir_inode_id} 的内容: {msg_ls_unused if msg_ls_unused else '未知错误'}",
-                3000,
-            )
             return
 
-        if entries:
-            # No need to sort here if setSortingEnabled(True) is used,
-            # unless a very specific initial non-column-click sort is required.
-            # The view will handle sorting based on the last clicked header or initial default.
-            # entries.sort(key=lambda x: (x.get("type") != FileType.DIRECTORY.name, x.get("name", "").lower()))
+        for entry in entries:
+            if entry.get("name") in [".", ".."]:
+                continue
 
-            for entry in entries:
-                if entry.get("name") == "." or entry.get("name") == "..":
-                    continue
+            type_str = entry.get("type", "UNKNOWN")
+            name_item = QStandardItem(entry.get("name", "N/A"))
+            name_item.setEditable(False)
+            name_item.setData(entry.get("inode_id"), INODE_ID_ROLE)
+            name_item.setData(type_str == FileType.DIRECTORY.name, IS_DIR_ROLE)
+            name_item.setData(type_str, TYPE_STR_ROLE)
 
-                name_str = entry.get("name", "N/A")
-                size_val = entry.get("size", 0)
-                type_str = entry.get("type", "UNKNOWN")
-                mtime_val = entry.get("mtime", 0)
-                inode_id_val = entry.get("inode_id")
+            if type_str == FileType.DIRECTORY.name:
+                name_item.setIcon(self._get_folder_icon())
+            elif type_str == FileType.SYMBOLIC_LINK.name:
+                name_item.setIcon(self._get_symlink_icon())
+            else:
+                name_item.setIcon(self._get_file_icon())
 
-                name_item = QStandardItem(name_str)
-                name_item.setEditable(False)
-                name_item.setData(inode_id_val, INODE_ID_ROLE)
-                name_item.setData(type_str == FileType.DIRECTORY.name, IS_DIR_ROLE)
-                name_item.setData(type_str, TYPE_STR_ROLE)
-                name_item.setIcon(
-                    self._get_folder_icon()
-                    if type_str == FileType.DIRECTORY.name
-                    else self._get_file_icon()
-                )
+            size_val = entry.get("size", 0)
+            size_str = f"{size_val} B" if type_str != FileType.DIRECTORY.name else ""
+            size_item = SortableStandardItem(size_str, size_val)
+            size_item.setTextAlignment(
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+            )
+            size_item.setEditable(False)
 
-                display_size_str = ""
-                actual_sort_size_key = 0
-                if type_str != FileType.DIRECTORY.name:
-                    display_size_str = f"{size_val} B"
-                    actual_sort_size_key = int(size_val)
-                else:
-                    display_size_str = ""
-                    actual_sort_size_key = int(size_val)
-                size_item = SortableStandardItem(display_size_str, actual_sort_size_key)
-                size_item.setTextAlignment(
-                    Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
-                )
-                size_item.setEditable(False)
+            type_item = QStandardItem(type_str)
+            type_item.setEditable(False)
 
-                type_display_item = QStandardItem(type_str)
-                type_display_item.setEditable(False)
+            mtime_val = entry.get("mtime", 0)
+            mtime_str = (
+                time.strftime("%Y-%m-%d %H:%M", time.localtime(mtime_val))
+                if mtime_val > 0
+                else "N/A"
+            )
+            date_item = SortableStandardItem(mtime_str, int(mtime_val))
+            date_item.setEditable(False)
 
-                mtime_readable = (
-                    time.strftime("%Y-%m-%d %H:%M", time.localtime(mtime_val))
-                    if mtime_val and mtime_val > 0
-                    else "N/A"
-                )
-                actual_sort_mtime_key = (
-                    int(mtime_val) if mtime_val and mtime_val > 0 else 0
-                )
-                date_item = SortableStandardItem(mtime_readable, actual_sort_mtime_key)
-                date_item.setEditable(False)
+            self.file_list_model.appendRow([name_item, size_item, type_item, date_item])
 
-                self.file_list_model.appendRow(
-                    [name_item, size_item, type_display_item, date_item]
-                )
-        self._update_go_up_action_state()  # Update after populating
+        self._update_go_up_action_state()
 
     def _create_base_actions(self):
+        style = self.style()
+        self.go_up_action = QAction(
+            style.standardIcon(QStyle.StandardPixmap.SP_FileDialogToParent),
+            "上一级(&U)",
+            self,
+        )
+        self.go_up_action.setStatusTip("返回上一级目录")
+        self.go_up_action.triggered.connect(self._gui_action_go_up)
+
         self.new_folder_action = QAction(
-            self._get_folder_icon(), "新建文件夹(&N)...", self
+            style.standardIcon(QStyle.StandardPixmap.SP_DirIcon),
+            "新建文件夹(&N)...",
+            self,
         )
         self.new_folder_action.setStatusTip("在当前位置创建一个新文件夹")
         self.new_folder_action.triggered.connect(self._gui_action_new_folder)
 
-        self.new_file_action = QAction(self._get_file_icon(), "新建文件(&F)...", self)
+        self.new_file_action = QAction(
+            style.standardIcon(QStyle.StandardPixmap.SP_FileIcon),
+            "新建文件(&F)...",
+            self,
+        )
         self.new_file_action.setStatusTip("在当前位置创建一个新空文件")
         self.new_file_action.triggered.connect(self._gui_action_new_file)
+
+        self.create_link_action = QAction(
+            style.standardIcon(QStyle.StandardPixmap.SP_FileLinkIcon),
+            "创建链接...",
+            self,
+        )
+        self.create_link_action.setStatusTip("为选中的项目创建一个符号链接")
+        self.create_link_action.triggered.connect(self._gui_action_create_link)
+
+        self.rename_action = QAction("重命名(&R)...", self)
+        self.rename_action.setStatusTip("重命名选中的文件或文件夹")
+        self.rename_action.setShortcut(QKeySequence("F2"))
+        self.rename_action.triggered.connect(self._gui_action_rename_item)
+
+        self.properties_action = QAction(
+            style.standardIcon(QStyle.StandardPixmap.SP_FileDialogInfoView),
+            "属性(&I)",
+            self,
+        )
+        self.properties_action.setStatusTip("查看选中项目的属性")
+        self.properties_action.triggered.connect(self._gui_action_show_properties)
+
+        self.delete_action = QAction(
+            style.standardIcon(QStyle.StandardPixmap.SP_TrashIcon), "删除(&D)", self
+        )
+        self.delete_action.setShortcut(QKeySequence("Delete"))
+        self.delete_action.setStatusTip("删除选中的文件或文件夹")
+        self.delete_action.triggered.connect(
+            self._gui_action_delete_item_from_selection
+        )
 
         self.create_user_action = QAction("创建用户...", self)
         self.create_user_action.setStatusTip("创建一个新用户 (仅限管理员)")
@@ -515,86 +525,42 @@ class MainWindow(QMainWindow):
         )
         self.format_disk_action.triggered.connect(self._gui_action_format_disk)
 
-        delete_icon = QIcon.fromTheme("edit-delete", QIcon.fromTheme("list-remove"))
-        if delete_icon.isNull():
-            style = self.style()
-            delete_icon = (
-                style.standardIcon(style.StandardPixmap.SP_TrashIcon)
-                if style
-                else QIcon()
-            )
-        self.delete_action = QAction(delete_icon, "删除(&D)", self)
-        self.delete_action.setShortcut(QKeySequence("Delete"))
-        self.delete_action.setStatusTip("删除选中的文件或文件夹")
-        self.delete_action.triggered.connect(
-            self._gui_action_delete_item_from_selection
+        self.exit_action = QAction(
+            style.standardIcon(QStyle.StandardPixmap.SP_DialogCloseButton),
+            "&退出",
+            self,
         )
-
-        exit_icon_menu = QIcon.fromTheme("application-exit")
-        if exit_icon_menu.isNull():
-            style = self.style()
-            exit_icon_menu = (
-                style.standardIcon(style.StandardPixmap.SP_DialogCloseButton)
-                if style
-                else QIcon()
-            )
-        self.exit_action = QAction(exit_icon_menu, "&退出", self)
         self.exit_action.setShortcut(QKeySequence("Ctrl+Q"))
         self.exit_action.setStatusTip("退出应用程序")
         self.exit_action.triggered.connect(self.close)
 
-        rename_icon = self.style().standardIcon(
-            QStyle.StandardPixmap.SP_FileDialogListView
-        )
-        self.rename_action = QAction(rename_icon, "重命名(&R)...", self)
-        self.rename_action.setStatusTip("重命名选中的文件或文件夹")
-        self.rename_action.setShortcut(QKeySequence("F2"))
-        self.rename_action.triggered.connect(self._gui_action_rename_item)
-
-        properties_icon = self.style().standardIcon(
-            QStyle.StandardPixmap.SP_FileDialogInfoView
-        )
-        self.properties_action = QAction(properties_icon, "属性(&I)", self)
-        self.properties_action.setStatusTip("查看选中项目的属性")
-        self.properties_action.triggered.connect(self._gui_action_show_properties)
-
-        go_up_icon = self.style().standardIcon(
-            QStyle.StandardPixmap.SP_FileDialogToParent
-        )
-        self.go_up_action = QAction(go_up_icon, "上一级(&U)", self)
-        self.go_up_action.setStatusTip("返回上一级目录")
-        self.go_up_action.triggered.connect(self._gui_action_go_up)
-        self.go_up_action.setEnabled(False)
-
     def _create_menus(self):
         menu_bar = self.menuBar()
-
-        menu_bar.addAction(self.go_up_action)  # 上一级按钮放前面
+        menu_bar.addAction(self.go_up_action)
         menu_bar.addSeparator()
 
-        menu_bar.addAction(self.new_folder_action)
-        menu_bar.addAction(self.new_file_action)
-        menu_bar.addAction(self.rename_action)
-        menu_bar.addAction(self.properties_action)
-        menu_bar.addAction(self.delete_action)
-        menu_bar.addSeparator()
+        file_menu = menu_bar.addMenu("文件(&F)")
+        file_menu.addAction(self.new_folder_action)
+        file_menu.addAction(self.new_file_action)
+        file_menu.addAction(self.create_link_action)
+        file_menu.addSeparator()
+        file_menu.addAction(self.exit_action)
 
-        # 管理/系统相关的操作可以放在一个子菜单或后面
-        admin_menu = menu_bar.addMenu("系统管理")
+        edit_menu = menu_bar.addMenu("编辑(&E)")
+        edit_menu.addAction(self.rename_action)
+        edit_menu.addAction(self.delete_action)
+        edit_menu.addSeparator()
+        edit_menu.addAction(self.properties_action)
+
+        admin_menu = menu_bar.addMenu("系统管理(&S)")
         admin_menu.addAction(self.create_user_action)
         admin_menu.addAction(self.format_disk_action)
 
-        menu_bar.addSeparator()
-        menu_bar.addAction(self.exit_action)
-
-        # 设置管理员按钮的初始状态
         is_admin = (
-            self.user_auth
-            and self.user_auth.get_current_user()
+            self.user_auth.get_current_user()
             and self.user_auth.get_current_user().uid == ROOT_UID
         )
-        self.create_user_action.setEnabled(is_admin)
-        self.format_disk_action.setEnabled(is_admin)
+        admin_menu.setEnabled(is_admin)
 
     def _create_status_bar(self):
         self.status_bar = QStatusBar()
@@ -607,14 +573,10 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
     def _gui_action_new_folder(self):
-        if not self.user_auth or self.current_cwd_inode_id is None:
+        current_user = self.user_auth.get_current_user()
+        if not current_user or self.current_cwd_inode_id is None:
             QMessageBox.warning(self, "错误", "会话或CWD无效")
             return
-        current_user = self.user_auth.get_current_user()
-        if not current_user:
-            QMessageBox.warning(self, "错误", "无用户信息")
-            return
-
         folder_name, ok = QInputDialog.getText(self, "新建文件夹", "文件夹名称:")
         if ok and folder_name:
             folder_name = folder_name.strip()
@@ -624,7 +586,6 @@ class MainWindow(QMainWindow):
             if "/" in folder_name:
                 QMessageBox.warning(self, "错误", "名称不能含 '/'")
                 return
-
             success, message, _ = make_directory(
                 self.disk_manager,
                 current_user.uid,
@@ -643,14 +604,10 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "错误", "名称不能为空")
 
     def _gui_action_new_file(self):
-        if not self.user_auth or self.current_cwd_inode_id is None:
+        current_user = self.user_auth.get_current_user()
+        if not current_user or self.current_cwd_inode_id is None:
             QMessageBox.warning(self, "错误", "会话或CWD无效")
             return
-        current_user = self.user_auth.get_current_user()
-        if not current_user:
-            QMessageBox.warning(self, "错误", "无用户信息")
-            return
-
         file_name, ok = QInputDialog.getText(self, "新建文件", "文件名称:")
         if ok and file_name:
             file_name = file_name.strip()
@@ -660,7 +617,6 @@ class MainWindow(QMainWindow):
             if "/" in file_name:
                 QMessageBox.warning(self, "错误", "名称不能含 '/'")
                 return
-
             success, message, _ = create_file(
                 self.disk_manager,
                 current_user.uid,
@@ -677,6 +633,63 @@ class MainWindow(QMainWindow):
                 self._refresh_current_views()
         elif ok:
             QMessageBox.warning(self, "错误", "名称不能为空")
+
+    def _gui_action_create_link(self):
+        selected_indexes = self.file_list_view.selectionModel().selectedRows()
+        if not selected_indexes:
+            QMessageBox.information(self, "提示", "请先选择一个文件或目录来创建链接。")
+            return
+
+        name_col_idx = self.file_list_model.index(selected_indexes[0].row(), 0)
+        target_name = self.file_list_model.data(
+            name_col_idx, Qt.ItemDataRole.DisplayRole
+        )
+
+        parent_path = get_inode_path_str(self.disk_manager, self.current_cwd_inode_id)
+        if parent_path.startswith("[Error"):
+            QMessageBox.warning(self, "错误", "无法确定目标项目的父路径。")
+            return
+
+        target_full_path = (
+            f"{parent_path}/{target_name}" if parent_path != "/" else f"/{target_name}"
+        )
+
+        default_link_name = f"{target_name} 的链接"
+        link_name, ok = QInputDialog.getText(
+            self,
+            "创建链接",
+            f"在当前目录创建指向 '{target_name}' 的链接，\n请输入链接名称:",
+            text=default_link_name,
+        )
+
+        if ok and link_name:
+            link_name = link_name.strip()
+            if not link_name:
+                QMessageBox.warning(self, "错误", "链接名称不能为空.")
+                return
+            if "/" in link_name:
+                QMessageBox.warning(self, "错误", "链接名称不能包含'/'。")
+                return
+
+            current_user = self.user_auth.get_current_user()
+            if not current_user:
+                QMessageBox.warning(self, "错误", "无用户信息。")
+                return
+
+            success, msg, _ = create_symbolic_link(
+                self.disk_manager,
+                current_user.uid,
+                self.current_cwd_inode_id,
+                link_name,
+                target_full_path,
+            )
+            (
+                QMessageBox.information(self, "结果", msg)
+                if success
+                else QMessageBox.warning(self, "失败", msg)
+            )
+            if success:
+                self._refresh_current_views()
 
     def _gui_action_delete_item_from_selection(self):
         selected_indexes = self.file_list_view.selectionModel().selectedRows()
@@ -712,30 +725,31 @@ class MainWindow(QMainWindow):
         )
 
     def _execute_delete_item(
-        self,
-        item_name: str,
-        item_inode_id: int,
-        item_type_str: str,
-        parent_inode_id: int,
+        self, item_name, item_inode_id, item_type_str, parent_inode_id
     ):
         current_user = self.user_auth.get_current_user()
         if not current_user:
             QMessageBox.warning(self, "错误", "未找到当前用户信息.")
             return
 
+        confirm_msg = (
+            f"<b>警告：您确定要删除文件夹 '{item_name}' 及其所有内容吗？</b>"
+            if item_type_str == FileType.DIRECTORY.name
+            else f"您确定要删除 '{item_name}' 吗？"
+        ) + "\n\n此操作无法撤销。"
         reply = QMessageBox.question(
             self,
             "确认删除",
-            f"您确定要删除 '{item_name}' 吗？\n此操作无法撤销。",
+            confirm_msg,
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
-        if reply == QMessageBox.StandardButton.No:
+        if reply != QMessageBox.StandardButton.Yes:
             return
 
-        success, message = False, ""
         uid = current_user.uid
-        if item_type_str == FileType.FILE.name:
+        success, message = False, ""
+        if item_type_str in [FileType.FILE.name, FileType.SYMBOLIC_LINK.name]:
             success, message = delete_file(
                 self.disk_manager, uid, parent_inode_id, item_name
             )
@@ -743,12 +757,9 @@ class MainWindow(QMainWindow):
             success, message = remove_directory(
                 self.disk_manager, uid, parent_inode_id, item_name
             )
-        else:
-            QMessageBox.critical(self, "错误", f"未知类型: {item_type_str}")
-            return
 
         if success:
-            QMessageBox.information(self, "成功", f"'{item_name}' 已删除.")
+            QMessageBox.information(self, "成功", f"'{item_name}' 已删除。")
             if self.pm:
                 self.pm.save_disk_image(self.disk_manager)
             self._refresh_current_views()
@@ -758,20 +769,14 @@ class MainWindow(QMainWindow):
     def _gui_action_rename_item(self):
         selected_indexes = self.file_list_view.selectionModel().selectedRows()
         if not selected_indexes:
-            QMessageBox.information(
-                self, "提示", "请在右侧文件列表中选择一个项目进行重命名."
-            )
+            QMessageBox.information(self, "提示", "请选择一个项目进行重命名.")
             return
 
-        name_column_model_index = self.file_list_model.index(
-            selected_indexes[0].row(), 0
-        )
-        old_name = self.file_list_model.data(
-            name_column_model_index, Qt.ItemDataRole.DisplayRole
-        )
+        name_col_idx = self.file_list_model.index(selected_indexes[0].row(), 0)
+        old_name = self.file_list_model.data(name_col_idx, Qt.ItemDataRole.DisplayRole)
 
         if old_name is None or old_name in [".", ".."]:
-            QMessageBox.warning(self, "错误", f"无法重命名特殊条目 '{old_name}'。")
+            QMessageBox.warning(self, "错误", f"无法重命名 '{old_name}'。")
             return
 
         new_name, ok = QInputDialog.getText(
@@ -807,7 +812,7 @@ class MainWindow(QMainWindow):
                 self._refresh_current_views()
             else:
                 QMessageBox.warning(self, "重命名失败", message)
-        elif ok and not new_name:
+        elif ok:
             QMessageBox.warning(self, "错误", "新名称不能为空。")
 
     def _show_list_context_menu(self, point: QPoint):
@@ -815,88 +820,38 @@ class MainWindow(QMainWindow):
         global_point = self.file_list_view.viewport().mapToGlobal(point)
         index_under_cursor = self.file_list_view.indexAt(point)
 
-        item_name_ctx, item_inode_id_ctx, item_type_str_ctx = None, None, None
-
         if index_under_cursor.isValid():
-            name_column_model_index = self.file_list_model.index(
-                index_under_cursor.row(), 0
+            name_col_idx = self.file_list_model.index(index_under_cursor.row(), 0)
+            item_name = self.file_list_model.data(
+                name_col_idx, Qt.ItemDataRole.DisplayRole
             )
-            item_name_ctx = self.file_list_model.data(
-                name_column_model_index, Qt.ItemDataRole.DisplayRole
-            )
-            item_inode_id_ctx = self.file_list_model.data(
-                name_column_model_index, INODE_ID_ROLE
-            )
-            item_type_str_ctx = self.file_list_model.data(
-                name_column_model_index, TYPE_STR_ROLE
-            )
-
-            if (
-                item_name_ctx
-                and item_inode_id_ctx is not None
-                and item_type_str_ctx
-                and item_name_ctx not in [".", ".."]
-            ):
-                # Ensure item is selected before showing context menu for actions like rename
+            if item_name and item_name not in [".", ".."]:
                 current_selection = self.file_list_view.selectionModel()
                 current_selection.clearSelection()
                 current_selection.select(
-                    name_column_model_index.siblingAtRow(name_column_model_index.row()),
+                    name_col_idx.siblingAtRow(name_col_idx.row()),
                     QItemSelectionModel.SelectionFlag.Rows
                     | QItemSelectionModel.SelectionFlag.Select,
                 )
 
-                delete_ctx_action = QAction(
-                    self._get_delete_icon(), f"删除 '{item_name_ctx}'", self
-                )
-                delete_ctx_action.triggered.connect(
-                    lambda: self._execute_delete_item(
-                        item_name_ctx,
-                        item_inode_id_ctx,
-                        item_type_str_ctx,
-                        self.current_cwd_inode_id,
-                    )
-                )
-                menu.addAction(delete_ctx_action)
-
-                rename_ctx_action = QAction(
-                    self.rename_action.icon(), f"重命名 '{item_name_ctx}'...", self
-                )
-                rename_ctx_action.triggered.connect(self._gui_action_rename_item)
-                menu.addAction(rename_ctx_action)
-
-                properties_ctx_action = QAction(
-                    self.properties_action.icon(), f"属性 '{item_name_ctx}'...", self
-                )
-                properties_ctx_action.triggered.connect(
-                    lambda: self._gui_action_show_properties(
-                        item_inode_id_to_show=item_inode_id_ctx
-                    )
-                )
-                menu.addAction(properties_ctx_action)
+                menu.addAction(self.rename_action)
+                menu.addAction(self.delete_action)
+                menu.addAction(self.properties_action)
+                menu.addAction(self.create_link_action)
                 menu.addSeparator()
 
         menu.addAction(self.new_folder_action)
         menu.addAction(self.new_file_action)
         menu.exec(global_point)
 
-    def _get_delete_icon(self) -> QIcon:
-        icon = QIcon.fromTheme(
-            "edit-delete", QIcon.fromTheme("list-remove", QIcon.fromTheme("user-trash"))
-        )
-        if icon.isNull():
-            style = self.style()
-            icon = (
-                style.standardIcon(style.StandardPixmap.SP_TrashIcon)
-                if style
-                else QIcon()
-            )
-        return icon
-
     def _refresh_current_views(self):
+        """
+        在操作后刷新所有相关视图（地址栏、文件列表、树状视图）以反映最新状态。
+        """
         if self.current_cwd_inode_id is None:
             return
 
+        # 1. 更新地址栏
         current_path_str = get_inode_path_str(
             self.disk_manager, self.current_cwd_inode_id
         )
@@ -906,36 +861,44 @@ class MainWindow(QMainWindow):
                 "错误",
                 f"当前工作目录无效: {current_path_str}。将尝试重置到根目录。",
             )
-            root_inode_id = (
+            root_id = (
                 self.disk_manager.superblock.root_inode_id
                 if self.disk_manager.superblock
                 else None
             )
-            if root_inode_id is not None:
-                self.current_cwd_inode_id = root_inode_id
-                self.user_auth.set_cwd_inode_id(root_inode_id)
-                current_path_str = get_inode_path_str(self.disk_manager, root_inode_id)
+            if root_id is not None:
+                self.current_cwd_inode_id = root_id
+                self.user_auth.set_cwd_inode_id(root_id)
+                current_path_str = get_inode_path_str(self.disk_manager, root_id)
             else:
                 self.address_bar.setText("[错误：无法访问文件系统根目录]")
                 self.file_list_model.setRowCount(0)
+                self.dir_tree_model.clear()
+                self._update_go_up_action_state()
                 return
         self.address_bar.setText(current_path_str)
 
+        # 2. 保存文件列表视图当前的排序状态
         header = self.file_list_view.horizontalHeader()
-        sort_column = header.sortIndicatorSection()
-        sort_order = header.sortIndicatorOrder()
-        self._populate_file_list_view(self.current_cwd_inode_id)
-        if self.file_list_model.rowCount() > 0:
-            self.file_list_view.sortByColumn(sort_column, sort_order)
-        self._update_go_up_action_state()  # Update "Go Up" button state
+        sort_info = (header.sortIndicatorSection(), header.sortIndicatorOrder())
 
-        # Refresh tree view for current directory's parent to reflect changes
-        # This is a simplified refresh, more complex logic might be needed for perfect sync
+        # 3. 重新填充文件列表视图
+        self._populate_file_list_view(self.current_cwd_inode_id)
+
+        # 4. 恢复文件列表的排序状态
+        if self.file_list_model.rowCount() > 0:
+            self.file_list_view.sortByColumn(*sort_info)
+
+        # 5. 更新“返回上一级”按钮的状态
+        self._update_go_up_action_state()
+
+        # 6. 刷新树状视图中当前目录的子节点
+        # 这是一个简化的刷新逻辑，确保在树状图中已展开的当前目录能反映其子目录的变化
         q_item_for_cwd = None
         if self.dir_tree_model.rowCount() > 0:
             root_gui_item = self.dir_tree_model.item(0)
 
-            # ... (find_item_by_inode_id_recursive remains the same)
+            # 递归函数，用于在树状模型中查找对应inode_id的QStandardItem
             def find_item_by_inode_id_recursive(
                 parent_item: QStandardItem, inode_id_to_find: int
             ) -> Optional[QStandardItem]:
@@ -955,119 +918,146 @@ class MainWindow(QMainWindow):
                 root_gui_item, self.current_cwd_inode_id
             )
 
+        # 如果在树中找到了当前目录的项，并且它是展开的，就重新加载它的子项
         if q_item_for_cwd:
-            # Force reload of children for the CWD item in the tree
-            q_item_for_cwd.setData(False, CHILDREN_LOADED_ROLE)  # Mark as not loaded
-            # If it's expanded, repopulate. If not, clear to force repopulation on next expand.
+            q_item_for_cwd.setData(
+                False, CHILDREN_LOADED_ROLE
+            )  # 标记为“未加载”以强制刷新
             if self.dir_tree_view.isExpanded(q_item_for_cwd.index()):
                 self._populate_children_in_tree(
                     q_item_for_cwd, self.current_cwd_inode_id
                 )
-            else:  # If not expanded, just clear current children (placeholders)
+            else:
+                # 如果未展开，则清空其现有子项（通常是占位符），以便下次展开时重新加载
                 q_item_for_cwd.removeRows(0, q_item_for_cwd.rowCount())
-                if q_item_for_cwd.data(
-                    IS_DIR_ROLE
-                ):  # Add placeholder back if it's a directory
+                # 如果它是个目录，重新添加一个占位符以显示展开箭头
+                if q_item_for_cwd.data(IS_DIR_ROLE):
                     q_item_for_cwd.appendRow(QStandardItem())
-        elif self.current_cwd_inode_id == (
-            self.disk_manager.superblock.root_inode_id
-            if self.disk_manager.superblock
-            else -1
-        ):
-            # If CWD is root and not found as an item (e.g. after format), refresh root
-            if self.dir_tree_model.rowCount() > 0:
-                root_gui_item = self.dir_tree_model.item(0)
-                if (
-                    root_gui_item
-                    and root_gui_item.data(INODE_ID_ROLE) == self.current_cwd_inode_id
-                ):
-                    self._populate_children_in_tree(
-                        root_gui_item, self.current_cwd_inode_id
-                    )
+
+        # 1. 更新地址栏
+        current_path_str = get_inode_path_str(
+            self.disk_manager, self.current_cwd_inode_id
+        )
+        if current_path_str.startswith("[Error"):
+            QMessageBox.warning(
+                self,
+                "错误",
+                f"当前工作目录无效: {current_path_str}。将尝试重置到根目录。",
+            )
+            root_id = (
+                self.disk_manager.superblock.root_inode_id
+                if self.disk_manager.superblock
+                else None
+            )
+            if root_id is not None:
+                self.current_cwd_inode_id = root_id
+                self.user_auth.set_cwd_inode_id(root_id)
+                current_path_str = get_inode_path_str(self.disk_manager, root_id)
+            else:
+                self.address_bar.setText("[错误：无法访问文件系统根目录]")
+                self.file_list_model.setRowCount(0)
+                self.dir_tree_model.clear()
+                self._update_go_up_action_state()
+                return
+        self.address_bar.setText(current_path_str)
+
+        # 2. 保存文件列表视图当前的排序状态
+        header = self.file_list_view.horizontalHeader()
+        sort_info = (header.sortIndicatorSection(), header.sortIndicatorOrder())
+
+        # 3. 重新填充文件列表视图
+        self._populate_file_list_view(self.current_cwd_inode_id)
+
+        # 4. 恢复文件列表的排序状态
+        if self.file_list_model.rowCount() > 0:
+            self.file_list_view.sortByColumn(*sort_info)
+
+        # 5. 更新“返回上一级”按钮的状态
+        self._update_go_up_action_state()
+
+        # 6. 刷新树状视图中当前目录的子节点
+        # 这是一个简化的刷新逻辑，确保在树状图中已展开的当前目录能反映其子目录的变化
+        q_item_for_cwd = None
+        if self.dir_tree_model.rowCount() > 0:
+            root_gui_item = self.dir_tree_model.item(0)
+
+            # 递归函数，用于在树状模型中查找对应inode_id的QStandardItem
+            def find_item_by_inode_id_recursive(
+                parent_item: QStandardItem, inode_id_to_find: int
+            ) -> Optional[QStandardItem]:
+                if parent_item.data(INODE_ID_ROLE) == inode_id_to_find:
+                    return parent_item
+                for row in range(parent_item.rowCount()):
+                    child_item = parent_item.child(row, 0)
+                    if child_item:
+                        found = find_item_by_inode_id_recursive(
+                            child_item, inode_id_to_find
+                        )
+                        if found:
+                            return found
+                return None
+
+            q_item_for_cwd = find_item_by_inode_id_recursive(
+                root_gui_item, self.current_cwd_inode_id
+            )
+
+        # 如果在树中找到了当前目录的项，并且它是展开的，就重新加载它的子项
+        if q_item_for_cwd:
+            q_item_for_cwd.setData(
+                False, CHILDREN_LOADED_ROLE
+            )  # 标记为“未加载”以强制刷新
+            if self.dir_tree_view.isExpanded(q_item_for_cwd.index()):
+                self._populate_children_in_tree(
+                    q_item_for_cwd, self.current_cwd_inode_id
+                )
+            else:
+                # 如果未展开，则清空其现有子项（通常是占位符），以便下次展开时重新加载
+                q_item_for_cwd.removeRows(0, q_item_for_cwd.rowCount())
+                # 如果它是个目录，重新添加一个占位符以显示展开箭头
+                if q_item_for_cwd.data(IS_DIR_ROLE):
+                    q_item_for_cwd.appendRow(QStandardItem())
 
     def _gui_action_show_properties(self, item_inode_id_to_show: Optional[int] = None):
         inode_id_for_props, name_for_props = None, "未知项目"
         if item_inode_id_to_show is not None:
             inode_id_for_props = item_inode_id_to_show
-            found_in_list = False
+            # Find name from list view if possible
             for row in range(self.file_list_model.rowCount()):
                 idx = self.file_list_model.index(row, 0)
                 if self.file_list_model.data(idx, INODE_ID_ROLE) == inode_id_for_props:
                     name_for_props = self.file_list_model.data(
                         idx, Qt.ItemDataRole.DisplayRole
                     )
-                    found_in_list = True
                     break
-            if not found_in_list:
-                path_for_name = get_inode_path_str(
-                    self.disk_manager, inode_id_for_props
-                )
-                if path_for_name and not path_for_name.startswith("[Error"):
-                    name_for_props = (
-                        path_for_name.split("/")[-1] if path_for_name != "/" else "/"
-                    )
-                else:
-                    QMessageBox.warning(
-                        self, "错误", f"无法为 inode {inode_id_for_props} 确定名称。"
-                    )
-                    return
         else:
             selected_indexes = self.file_list_view.selectionModel().selectedRows()
             if not selected_indexes:
                 inode_id_for_props = self.current_cwd_inode_id
                 if inode_id_for_props is None:
-                    QMessageBox.information(
-                        self, "提示", "没有选中的项目，当前目录也无效。"
-                    )
+                    QMessageBox.information(self, "提示", "没有选中的项目。")
                     return
-                path_of_cwd = get_inode_path_str(self.disk_manager, inode_id_for_props)
-                name_for_props = (
-                    path_of_cwd.split("/")[-1] if path_of_cwd != "/" else "/"
-                )
             else:
-                name_column_model_index = self.file_list_model.index(
-                    selected_indexes[0].row(), 0
-                )
+                name_col_idx = self.file_list_model.index(selected_indexes[0].row(), 0)
                 inode_id_for_props = self.file_list_model.data(
-                    name_column_model_index, INODE_ID_ROLE
-                )
-                name_for_props = self.file_list_model.data(
-                    name_column_model_index, Qt.ItemDataRole.DisplayRole
+                    name_col_idx, INODE_ID_ROLE
                 )
 
         if inode_id_for_props is None:
             QMessageBox.warning(self, "错误", "无法确定要显示属性的项目。")
             return
+
         target_inode = self.disk_manager.get_inode(inode_id_for_props)
         if not target_inode:
             QMessageBox.warning(
                 self, "错误", f"无法找到 inode {inode_id_for_props} 的详细信息。"
             )
             return
-        if target_inode.id == self.disk_manager.superblock.root_inode_id:
-            name_for_props = "/"
 
-        full_path_str = "[路径解析中...]"  # Default
-        # Determine parent inode ID for constructing full path of files
-        parent_inode_id_for_path = (
-            self.current_cwd_inode_id
-        )  # Assume current CWD is parent for items in list view
-
-        if target_inode.type == FileType.FILE:
-            # Try to get path of parent directory
-            # If target_inode_id_to_show was from context menu, self.current_cwd_inode_id is its parent.
-            # If it was properties of CWD itself (which is a dir), that's handled by DIRECTORY case.
-            parent_path_str = get_inode_path_str(
-                self.disk_manager, parent_inode_id_for_path
-            )
-            if parent_path_str.startswith("[Error"):
-                full_path_str = f"{parent_path_str}/{name_for_props}"
-            elif parent_path_str == "/":
-                full_path_str = f"/{name_for_props}"
-            else:
-                full_path_str = f"{parent_path_str}/{name_for_props}"
-        elif target_inode.type == FileType.DIRECTORY:
-            full_path_str = get_inode_path_str(self.disk_manager, target_inode.id)
+        full_path_str = get_inode_path_str(self.disk_manager, target_inode.id)
+        if full_path_str.startswith("[Error"):
+            name_for_props = name_for_props  # Use best guess name
+        else:
+            name_for_props = full_path_str.split("/")[-1] or "/"
 
         item_details = {
             "name": name_for_props,
@@ -1087,8 +1077,10 @@ class MainWindow(QMainWindow):
         dialog.exec()
 
     def _gui_action_create_user(self):
-        current_user = self.user_auth.get_current_user()
-        if not current_user or current_user.uid != ROOT_UID:
+        if not (
+            self.user_auth.get_current_user()
+            and self.user_auth.get_current_user().uid == ROOT_UID
+        ):
             QMessageBox.warning(self, "权限不足", "只有root用户才能创建新用户。")
             return
 
@@ -1096,7 +1088,7 @@ class MainWindow(QMainWindow):
         if not (ok_user and new_username.strip()):
             if ok_user:
                 QMessageBox.warning(self, "输入错误", "用户名不能为空。")
-            return
+                return
         new_username = new_username.strip()
 
         new_password, ok_pass = QInputDialog.getText(
@@ -1106,21 +1098,20 @@ class MainWindow(QMainWindow):
             QLineEdit.EchoMode.Password,
         )
         if not ok_pass:
-            return  # User cancelled password input
-        # Allow empty password, but UserAuthenticator might reject it if it has policies
+            return
 
         success, message = self.user_auth.create_user(new_username, new_password)
-
         (
             QMessageBox.information(self, "结果", message)
             if success
             else QMessageBox.warning(self, "创建失败", message)
         )
-        # No disk persistence for user list in this version of UserAuthenticator
 
     def _gui_action_format_disk(self):
-        current_user = self.user_auth.get_current_user()
-        if not current_user or current_user.uid != ROOT_UID:
+        if not (
+            self.user_auth.get_current_user()
+            and self.user_auth.get_current_user().uid == ROOT_UID
+        ):
             QMessageBox.warning(self, "权限不足", "只有root用户才能格式化磁盘。")
             return
 
@@ -1134,8 +1125,7 @@ class MainWindow(QMainWindow):
         if reply != QMessageBox.StandardButton.Yes:
             return
 
-        success_format = self.disk_manager.format_disk()
-        if success_format:
+        if self.disk_manager.format_disk():
             QMessageBox.information(
                 self, "格式化成功", "磁盘已成功格式化。\n系统状态已重置。"
             )
@@ -1147,12 +1137,9 @@ class MainWindow(QMainWindow):
                 and self.disk_manager.superblock.root_inode_id is not None
             ):
                 new_root_id = self.disk_manager.superblock.root_inode_id
-                self.user_auth.set_cwd_inode_id(
-                    new_root_id
-                )  # Reset CWD for current (root) user
+                self.user_auth.set_cwd_inode_id(new_root_id)
                 self.current_cwd_inode_id = new_root_id
 
-                # Reset Tree View
                 self.dir_tree_model.clear()
                 root_item = QStandardItem("/")
                 root_item.setIcon(self._get_folder_icon())
@@ -1161,19 +1148,11 @@ class MainWindow(QMainWindow):
                 root_item.setData(True, IS_DIR_ROLE)
                 root_item.setData(False, CHILDREN_LOADED_ROLE)
                 self.dir_tree_model.appendRow(root_item)
-                self._populate_children_in_tree(
-                    root_item, new_root_id
-                )  # Load root's children
+                self._populate_children_in_tree(root_item, new_root_id)
                 self.dir_tree_view.expand(root_item.index())
-
-                self._refresh_current_views()  # This will also call _populate_file_list_view for the new root
+                self._refresh_current_views()
             else:
-                QMessageBox.critical(
-                    self, "错误", "格式化后无法找到根目录，系统可能不稳定。"
-                )
-                self.address_bar.setText("[错误：系统未正确初始化]")
-                self.file_list_model.setRowCount(0)
-                self.dir_tree_model.setRowCount(0)
+                QMessageBox.critical(self, "错误", "格式化后无法找到根目录。")
         else:
             QMessageBox.critical(self, "格式化失败", "磁盘格式化过程中发生错误。")
         self._update_go_up_action_state()
@@ -1185,197 +1164,91 @@ class MainWindow(QMainWindow):
             or self.current_cwd_inode_id == self.disk_manager.superblock.root_inode_id
         ):
             return
-
-        parent_inode_id = _resolve_path_to_inode_id(  # Use the imported one
+        parent_inode_id = _resolve_path_to_inode_id(
             self.disk_manager,
             self.current_cwd_inode_id,
             self.disk_manager.superblock.root_inode_id,
             "..",
         )
-
         if parent_inode_id is not None:
             self.current_cwd_inode_id = parent_inode_id
             self.user_auth.set_cwd_inode_id(parent_inode_id)
-            self.address_bar.setText(
-                get_inode_path_str(self.disk_manager, parent_inode_id)
-            )
-            self._populate_file_list_view(
-                parent_inode_id
-            )  # This calls _update_go_up_action_state
+            self._refresh_current_views()
             self._expand_and_select_in_tree(parent_inode_id)
         else:
             QMessageBox.warning(self, "错误", "无法确定上一级目录。")
 
     def _update_go_up_action_state(self):
-        if (
+        is_not_root = (
             self.current_cwd_inode_id is not None
-            and self.disk_manager
             and self.disk_manager.superblock
             and self.current_cwd_inode_id != self.disk_manager.superblock.root_inode_id
-        ):
-            self.go_up_action.setEnabled(True)
-        else:
-            self.go_up_action.setEnabled(False)
+        )
+        self.go_up_action.setEnabled(is_not_root)
 
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
 
-    class MockInode:  # Simplified
-        def __init__(
-            self,
-            id_val,
-            type_val,
-            name="",
-            size=0,
-            mtime=None,
-            owner_uid=0,
-            permissions=0o644,
-            link_count=1,
-            blocks_count=0,
-        ):
-            self.id = id_val
-            self.type = type_val
-            self.name = name
-            self.size = size
-            self.mtime = mtime if mtime is not None else time.time()
-            self.atime = self.mtime
-            self.ctime = self.mtime
-            self.owner_uid = owner_uid
-            self.permissions = permissions
-            self.link_count = link_count
-            self.blocks_count = blocks_count
-            if self.type == FileType.DIRECTORY:
-                self.permissions = 0o755
-                self.link_count = 2
-
-    class MockDiskManager:  # Simplified
+    # Dummy classes for standalone testing
+    class MockDisk:
         def __init__(self):
             self.is_formatted = True
-            self.superblock = type(
-                "SB", (), {"root_inode_id": 0, "total_inodes": 20, "block_size": 512}
-            )()
-            self.inodes_map = {}
-            self.dir_entries_map = {}
-            self._init_mock_data()
-
-        def _init_mock_data(self):
-            self.inodes_map = {
-                0: MockInode(0, FileType.DIRECTORY, "/", size=3),
-                1: MockInode(1, FileType.DIRECTORY, "dirA", size=2),
-                2: MockInode(2, FileType.FILE, "fileA.txt", size=1024),
-                3: MockInode(
-                    3, FileType.FILE, "fileB.log", size=200, mtime=time.time() - 3600
-                ),
+            self.superblock = type("SB", (), {"root_inode_id": 0})()
+            self.inodes = {
+                0: type("Inode", (), {"id": 0, "type": FileType.DIRECTORY})()
             }
-            self.dir_entries_map = {
-                0: [
-                    DirectoryEntry(".", 0),
-                    DirectoryEntry("..", 0),
-                    DirectoryEntry("dirA", 1),
-                    DirectoryEntry("fileA.txt", 2),
-                    DirectoryEntry("fileB.log", 3),
-                ],
-                1: [DirectoryEntry(".", 1), DirectoryEntry("..", 0)],
-            }
-            self.inodes_map[0].size = len(self.dir_entries_map[0])  # Correct dir size
-            self.inodes_map[1].size = len(self.dir_entries_map[1])
+            self.dir_entries = {0: []}
 
-        def get_inode(self, inode_id):
-            return self.inodes_map.get(inode_id)
+        def get_inode(self, id):
+            return self.inodes.get(id)
 
         def format_disk(self):
-            print("Mock DM: format_disk called")
-            self._init_mock_data()
+            print("Mock format")
             return True
 
         def save_disk_image(self):
-            print("Mock DM: Disk image saved (simulated).")
+            pass
 
-    class MockUserAuth:  # Simplified
+    class MockAuth:
         def __init__(self):
-            self.current_user = type(
-                "User", (), {"username": "mock_root", "uid": ROOT_UID}
-            )()
-            self.cwd_inode_id = 0
+            self.user = type("User", (), {"username": "mock", "uid": 0})()
+            self.cwd = 0
 
         def get_current_user(self):
-            return self.current_user
+            return self.user
 
         def get_cwd_inode_id(self):
-            return self.cwd_inode_id
+            return self.cwd
 
-        def set_cwd_inode_id(self, inode_id):
-            self.cwd_inode_id = inode_id
+        def set_cwd_inode_id(self, id):
+            self.cwd = id
 
         def create_user(self, u, p):
-            print(f"Mock UA: create_user({u}, {p})")
             return True, f"Mock user {u} created."
 
-    class MockPersistenceManager:  # Simplified
+    class MockPM:
         def save_disk_image(self, disk):
-            print("Mock PM: Disk image saved (simulated).")
+            pass
 
-    _original_list_directory = list_directory
-    _original_resolve_path = _resolve_path_to_inode_id
+    # Mock backend functions
+    def mock_list_dir(dm, id):
+        return True, "", []
 
-    # Mock essential backend functions
-    def mock_list_directory_minimal(dm_mock, inode_id_mock):
-        entries = dm_mock.dir_entries_map.get(inode_id_mock, [])
-        detailed_mock_entries = []
-        for entry_obj in entries:
-            inode = dm_mock.get_inode(entry_obj.inode_id)
-            if inode:
-                detailed_mock_entries.append(
-                    {
-                        "name": entry_obj.name,
-                        "inode_id": entry_obj.inode_id,
-                        "type": inode.type.name,
-                        "size": inode.size,
-                        "mtime": inode.mtime,
-                    }
-                )
-        return True, "Mock success", detailed_mock_entries
+    def mock_resolve(dm, cwd, root, path):
+        return 0 if path in ["/", ".."] else None
 
-    def mock_resolve_path_minimal(dm_mock, cwd_id, root_id, path_str):
-        if path_str == "..":
-            if cwd_id == root_id:
-                return root_id
-            for (
-                p_id,
-                entries,
-            ) in dm_mock.dir_entries_map.items():  # Find parent of cwd_id
-                if any(
-                    e.inode_id == cwd_id and e.name != "." and e.name != ".."
-                    for e in entries
-                ):
-                    return p_id
-            return None  # Should not happen if cwd_id is not root
-        # Basic name resolution in CWD
-        if path_str in [e.name for e in dm_mock.dir_entries_map.get(cwd_id, [])]:
-            return next(
-                e.inode_id
-                for e in dm_mock.dir_entries_map.get(cwd_id, [])
-                if e.name == path_str
-            )
-        if path_str == "/":
-            return root_id
-        if not path_str:
-            return cwd_id  # current dir for empty path
-        return None  # Simplified
+    original_list_dir = list_directory
+    original_resolve = _resolve_path_to_inode_id
+    list_directory = mock_list_dir
+    _resolve_path_to_inode_id = mock_resolve
 
-    list_directory = mock_list_directory_minimal
-    _resolve_path_to_inode_id = mock_resolve_path_minimal
-
-    mock_dm_instance = MockDiskManager()
-    mock_auth_instance = MockUserAuth()
-    mock_pm_instance = MockPersistenceManager()
-
-    main_win = MainWindow(mock_dm_instance, mock_auth_instance, mock_pm_instance)
+    main_win = MainWindow(MockDisk(), MockAuth(), MockPM())
     main_win.show()
-    app_exit_code = app.exec()
 
-    list_directory = _original_list_directory  # Restore
-    _resolve_path_to_inode_id = _original_resolve_path
+    exit_code = app.exec()
 
-    sys.exit(app_exit_code)
+    list_directory = original_list_dir
+    _resolve_path_to_inode_id = original_resolve
+
+    sys.exit(exit_code)

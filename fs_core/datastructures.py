@@ -7,6 +7,7 @@ from typing import List, Dict, Optional
 class FileType(Enum):
     FILE = 1
     DIRECTORY = 2
+    SYMBOLIC_LINK = 3
 
 
 # 定义权限常量 (简化版)
