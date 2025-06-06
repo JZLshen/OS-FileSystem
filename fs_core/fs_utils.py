@@ -1,10 +1,6 @@
 from typing import Tuple, Optional, List
-
-# 需要从其他模块导入必要的类和函数
 from .datastructures import Inode, DirectoryEntry, FileType
 from .disk_manager import DiskManager
-
-# _read_directory_entries 用于读取目录内容
 from .dir_ops import _read_directory_entries
 
 

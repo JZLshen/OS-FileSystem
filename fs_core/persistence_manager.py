@@ -1,19 +1,8 @@
 import pickle
 from typing import Optional
-import os  # 用于检查文件是否存在等
+import os
+from .disk_manager import DiskManager
 
-# 尝试导入DiskManager。使用相对导入（如果我们假设persistence_manager和disk_manager在同一个包内）
-# 如果出现导入错误，可能需要根据您的项目结构调整
-try:
-    from .disk_manager import DiskManager
-except ImportError:
-    # 如果上面的相对导入失败（例如，当直接运行此文件或从不同结构调用时），
-    # 尝试另一种方式，但这通常表明项目结构或PYTHONPATH可能需要调整。
-    # 对于我们规划的结构，`.disk_manager` 应该是正确的。
-    from disk_manager import DiskManager
-
-
-# 默认磁盘镜像文件路径 (可以考虑放在 config.py 中)
 DEFAULT_DISK_IMAGE_PATH = "simulated_disk.img"
 
 

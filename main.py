@@ -8,7 +8,6 @@ from user_management.user_auth import UserAuthenticator
 from gui.login_window import LoginWindow
 from gui.main_window import MainWindow
 
-# Import backend operation functions
 from fs_core.dir_ops import (
     make_directory,
     list_directory,

@@ -1,4 +1,3 @@
-# gui/properties_dialog.py
 import time
 from PyQt6.QtWidgets import (
     QDialog,
@@ -12,9 +11,6 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 from PyQt6.QtCore import Qt
-
-# 假设 FileType 在项目中可访问，用于权限字符串的 'd' 前缀
-# from fs_core.datastructures import FileType # 如果需要直接引用 FileType.DIRECTORY.name
 
 
 class PropertiesDialog(QDialog):

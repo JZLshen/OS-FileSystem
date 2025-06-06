@@ -1,10 +1,9 @@
 import time
-import pickle  # Though not directly used in all functions, good for file_ops module
+import pickle
 from typing import Tuple, Optional, List
 
 from .disk_manager import DiskManager
 
-# Ensure all necessary datastructures are imported, including new ones
 from .datastructures import (
     Inode,
     DirectoryEntry,
@@ -14,14 +13,12 @@ from .datastructures import (
     OpenFileEntry,
 )
 
-# We need helpers from dir_ops
 from .dir_ops import (
     _read_directory_entries,
     _write_directory_entries,
     _resolve_path_to_inode_id,
 )
 
-# UserAuthenticator is needed for open/close to manage file descriptors
 from user_management.user_auth import UserAuthenticator
 
 

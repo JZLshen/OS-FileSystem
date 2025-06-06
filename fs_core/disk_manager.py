@@ -6,8 +6,8 @@ from .datastructures import Inode, DirectoryEntry, Superblock, FileType, Permiss
 
 # 默认配置 (未来可以移到 config.py)
 DEFAULT_NUM_INODES = 1024
-DEFAULT_NUM_BLOCKS = 4096  # 例如，4096个块
-DEFAULT_BLOCK_SIZE = 512  # 例如，每个块512字节
+DEFAULT_NUM_BLOCKS = 4096  # 4096个块
+DEFAULT_BLOCK_SIZE = 512  # 每个块512字节
 ROOT_UID = 0  # 根用户的UID
 
 

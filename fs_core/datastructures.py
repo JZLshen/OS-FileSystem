@@ -10,9 +10,7 @@ class FileType(Enum):
     SYMBOLIC_LINK = 3
 
 
-# 定义权限常量 (简化版)
-# 实际Linux权限会更复杂 (用户User, 组Group, 其他Other, 分别对应读Read, 写Write, 执行Execute)
-# 这里我们先定义一个简单的权限模式
+# 定义权限常量
 class Permissions:
     READ = 0b100  # 4
     WRITE = 0b010  # 2

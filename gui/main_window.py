@@ -25,7 +25,6 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtGui import QAction, QStandardItemModel, QStandardItem, QIcon, QKeySequence
 from PyQt6.QtCore import Qt, QModelIndex, QPoint, QItemSelectionModel
 
-# Backend Imports
 from fs_core.dir_ops import (
     list_directory,
     make_directory,
@@ -38,7 +37,6 @@ from fs_core.datastructures import FileType
 from fs_core.fs_utils import get_inode_path_str
 from user_management.user_auth import ROOT_UID
 
-# GUI Component Imports
 from .text_editor_dialog import TextEditorDialog
 from .properties_dialog import PropertiesDialog
 

@@ -11,13 +11,7 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QMessageBox,
 )
-
-# PyQt6.QtCore.Qt 用于对齐等
 from PyQt6.QtCore import Qt
-
-# 假设 UserAuthenticator 在 user_management 包中
-# from ..user_management.user_auth import UserAuthenticator # 这种相对导入在直接运行此文件时会有问题
-# 在实际应用中，UserAuthenticator实例会由主应用创建并传递进来
 
 
 class LoginWindow(QDialog):

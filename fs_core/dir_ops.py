@@ -1,5 +1,3 @@
-# fs_core/dir_ops.py
-
 import time
 import pickle
 from typing import Tuple, Optional, List, Dict, Any
