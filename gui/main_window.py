@@ -310,44 +310,39 @@ class MainWindow(QMainWindow):
             self._open_file_by_inode(item_inode_id, item_name)
 
     def _open_file_by_inode(self, inode_id: int, name_hint: Optional[str] = None):
-        """
-        辅助函数：当已知文件的inode时，打开该文件。
-        """
+        """辅助函数：当已知文件的inode时，打开该文件。"""
         target_inode = self.disk_manager.get_inode(inode_id)
         if not target_inode:
             QMessageBox.critical(self, "错误", f"无法找到inode {inode_id}。")
             return
 
-        # --- BUG修复 ---
-        # 错误：直接用文件的inode ID无法解析路径，因为它没有".."条目。
-        # 正确做法：获取当前工作目录（即文件的父目录）的路径，然后追加文件名。
+        # 修正：通过父目录路径和文件名来构建完整路径
         parent_path = get_inode_path_str(self.disk_manager, self.current_cwd_inode_id)
         if parent_path.startswith("[Error"):
             QMessageBox.critical(self, "错误", f"无法解析父目录路径以打开文件。")
             return
 
-        # 如果没有从UI获得文件名提示，则需要反向在父目录中查找（这会比较低效，但更健壮）
         file_name = name_hint
-        if not file_name:
-            parent_entries = (
-                list_directory(self.disk_manager, self.current_cwd_inode_id)[2] or []
+        if not file_name:  # 如果没有从UI获得文件名，则需要查找
+            success, _, parent_entries = list_directory(
+                self.disk_manager, self.current_cwd_inode_id
             )
-            found_entry = next(
-                (e for e in parent_entries if e.get("inode_id") == inode_id), None
-            )
-            if found_entry:
-                file_name = found_entry.get("name")
-            else:
-                QMessageBox.critical(
-                    self, "错误", f"在当前目录中找不到inode {inode_id}对应的文件名。"
+            if success and parent_entries:
+                found_entry = next(
+                    (e for e in parent_entries if e.get("inode_id") == inode_id), None
                 )
-                return
+                if found_entry:
+                    file_name = found_entry.get("name")
 
-        # 构造文件的完整路径
+        if not file_name:
+            QMessageBox.critical(
+                self, "错误", f"在当前目录中找不到inode {inode_id}对应的文件名。"
+            )
+            return
+
         file_path = (
             f"{parent_path}/{file_name}" if parent_path != "/" else f"/{file_name}"
         )
-        # --- 修复结束 ---
 
         # 检查是否是文本文件并使用编辑器打开
         is_text = any(
@@ -359,9 +354,8 @@ class MainWindow(QMainWindow):
                 self.disk_manager, self.user_auth, self.pm, file_path, file_name, self
             )
             editor.exec()
-            self._refresh_current_views()  # 刷新视图以防文件大小等属性被修改
+            self._refresh_current_views()
         else:
-            # 对于非文本文件，显示其属性
             self._gui_action_show_properties(item_inode_id_to_show=inode_id)
 
     def _expand_and_select_in_tree(self, target_inode_id: int):
@@ -1017,9 +1011,10 @@ class MainWindow(QMainWindow):
 
     def _gui_action_show_properties(self, item_inode_id_to_show: Optional[int] = None):
         inode_id_for_props, name_for_props = None, "未知项目"
+
         if item_inode_id_to_show is not None:
             inode_id_for_props = item_inode_id_to_show
-            # Find name from list view if possible
+            # 尝试从当前文件列表中找到它的名字
             for row in range(self.file_list_model.rowCount()):
                 idx = self.file_list_model.index(row, 0)
                 if self.file_list_model.data(idx, INODE_ID_ROLE) == inode_id_for_props:
@@ -1030,6 +1025,7 @@ class MainWindow(QMainWindow):
         else:
             selected_indexes = self.file_list_view.selectionModel().selectedRows()
             if not selected_indexes:
+                # 如果没有选中项，则显示当前目录的属性
                 inode_id_for_props = self.current_cwd_inode_id
                 if inode_id_for_props is None:
                     QMessageBox.information(self, "提示", "没有选中的项目。")
@@ -1051,11 +1047,28 @@ class MainWindow(QMainWindow):
             )
             return
 
-        full_path_str = get_inode_path_str(self.disk_manager, target_inode.id)
-        if full_path_str.startswith("[Error"):
-            name_for_props = name_for_props  # Use best guess name
-        else:
+        # --- 修正：为所有类型的文件/链接正确构建路径 ---
+        full_path_str = ""
+        if target_inode.type == FileType.DIRECTORY:
+            full_path_str = get_inode_path_str(self.disk_manager, target_inode.id)
             name_for_props = full_path_str.split("/")[-1] or "/"
+        else:  # 对于文件和符号链接
+            parent_path = get_inode_path_str(
+                self.disk_manager, self.current_cwd_inode_id
+            )
+            if parent_path.startswith("[Error"):
+                full_path_str = f"[父路径错误]/{name_for_props}"
+            else:
+                full_path_str = (
+                    f"{parent_path}/{name_for_props}"
+                    if parent_path != "/"
+                    else f"/{name_for_props}"
+                )
+
+        if full_path_str.startswith("[Error"):
+            QMessageBox.warning(
+                self, "路径警告", f"无法完全解析项目路径: {full_path_str}"
+            )
 
         item_details = {
             "name": name_for_props,
