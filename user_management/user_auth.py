@@ -1,17 +1,14 @@
 from typing import Optional, Dict, Tuple
-
-# 假设 OpenFileEntry 定义在 fs_core.datastructures 中
-# 如果您的项目结构使得这个导入有问题，您可能需要调整 OpenFileEntry 的位置或导入路径
-from fs_core.datastructures import OpenFileEntry  # <--- 新增：导入 OpenFileEntry
+from fs_core.datastructures import OpenFileEntry
 
 # 可以在 config.py 中定义默认用户，这里先硬编码
 DEFAULT_USERS_DATA = {
     "root": {
         "uid": 0,
-        "password": "root_password",
+        "password": "root",
         "home_inode_id": None,
     },  # home_inode_id 可以在格式化后设置
-    "guest": {"uid": 1000, "password": "guest_password", "home_inode_id": None},
+    "guest": {"uid": 1000, "password": "guest", "home_inode_id": None},
 }
 # ROOT_UID 应该与 disk_manager.py 中的 ROOT_UID 一致
 ROOT_UID = 0
@@ -31,8 +28,8 @@ class User:
     ):
         self.uid: int = uid
         self.username: str = username
-        self.password_hash: str = password_hash  # 实际应用中应存储密码的哈希值
-        self.home_inode_id: Optional[int] = home_inode_id  # 用户家目录的i节点ID
+        self.password_hash: str = password_hash
+        self.home_inode_id: Optional[int] = home_inode_id
 
     def __repr__(self) -> str:
         return f"User(uid={self.uid}, username='{self.username}', home_inode_id={self.home_inode_id})"
@@ -48,11 +45,10 @@ class UserAuthenticator:
         self._load_default_users()
 
         self.current_user: Optional[User] = None
-        self.current_user_cwd_inode_id: Optional[int] = None  # 已有：CWD i节点ID
+        self.current_user_cwd_inode_id: Optional[int] = None
 
-        # 新增：当前用户打开的文件描述符表 {fd: OpenFileEntry}
         self.current_user_open_files: Dict[int, OpenFileEntry] = {}
-        self._next_fd: int = 0  # 新增：用于分配简单的、递增的文件描述符
+        self._next_fd: int = 0
 
     def _load_default_users(self):
         """加载/初始化默认用户"""
@@ -60,7 +56,7 @@ class UserAuthenticator:
             self.users[username] = User(
                 uid=data["uid"],
                 username=username,
-                password_hash=data["password"],  # 简化：密码直接存储
+                password_hash=data["password"],
                 home_inode_id=data["home_inode_id"],
             )
         print(f"Initialized users: {list(self.users.keys())}")
@@ -83,20 +79,19 @@ class UserAuthenticator:
 
         if user.password_hash == password_plaintext:
             self.current_user = user
-            # 设置初始CWD
             if user.uid == ROOT_UID and root_inode_id is not None:
                 self.current_user_cwd_inode_id = root_inode_id
             elif user.home_inode_id is not None:
                 self.current_user_cwd_inode_id = user.home_inode_id
-            elif root_inode_id is not None:
+            elif root_inode_id is not None:  # Fallback to root if user home not set
                 self.current_user_cwd_inode_id = root_inode_id
             else:
-                self.current_user_cwd_inode_id = None
+                self.current_user_cwd_inode_id = (
+                    None  # Should not happen if disk is formatted
+                )
 
-            # 新增：清空/重置打开文件相关状态
             self.current_user_open_files = {}
             self._next_fd = 0
-
             return (
                 True,
                 f"User '{username}' logged in successfully. CWD set to inode {self.current_user_cwd_inode_id}.",
@@ -107,21 +102,70 @@ class UserAuthenticator:
     def logout(self) -> Tuple[bool, str]:
         if self.current_user:
             username = self.current_user.username
-
-            # 新增：处理打开的文件
             if self.current_user_open_files:
                 print(
                     f"Warning: User '{username}' logged out with {len(self.current_user_open_files)} open file(s). Forcing close."
                 )
-                self.current_user_open_files.clear()  # 清空打开文件表
+                self.current_user_open_files.clear()
 
             self.current_user = None
             self.current_user_cwd_inode_id = None
-            self._next_fd = 0  # 新增：重置fd分配器
-
+            self._next_fd = 0
             return True, f"User '{username}' logged out successfully."
         else:
             return False, "Logout failed: No user is currently logged in."
+
+    def create_user(
+        self,
+        new_username: str,
+        new_password_plaintext: str,
+        new_uid: Optional[int] = None,
+        new_home_inode_id: Optional[int] = None,
+    ) -> Tuple[bool, str]:
+        if not new_username:
+            return False, "错误：用户名不能为空。"
+        if new_username in self.users:
+            return False, f"错误：用户 '{new_username}' 已存在。"
+
+        assigned_uid: int
+        existing_uids = {user.uid for user in self.users.values()}
+
+        if new_uid is not None:
+            if new_uid in existing_uids:
+                return False, f"错误：UID {new_uid} 已被占用。"
+            assigned_uid = new_uid
+        else:
+            # 自动分配 UID, 确保不与 ROOT_UID 冲突且从 1000 开始（如果可能）
+            candidate_uid = 1000
+            if not existing_uids:  # 如果除了默认用户外没有其他用户了
+                pass  # candidate_uid is 1000
+            else:
+                # 确保从现有最大非root UID之后开始，或者至少是1000
+                max_non_root_uid = 0
+                for uid_val in existing_uids:
+                    if uid_val != ROOT_UID and uid_val > max_non_root_uid:
+                        max_non_root_uid = uid_val
+                candidate_uid = max(1000, max_non_root_uid + 1)
+
+            while candidate_uid in existing_uids or candidate_uid == ROOT_UID:
+                candidate_uid += 1
+            assigned_uid = candidate_uid
+
+        # 实际应用中，密码应哈希存储
+        # password_hash_to_store = some_hash_function(new_password_plaintext)
+        password_hash_to_store = new_password_plaintext  # 保持项目当前简化逻辑
+
+        new_user = User(
+            uid=assigned_uid,
+            username=new_username,
+            password_hash=password_hash_to_store,
+            home_inode_id=new_home_inode_id,  # 通常在创建用户后，再单独创建家目录并更新此值
+        )
+        self.users[new_username] = new_user
+        print(
+            f"User '{new_username}' (UID: {assigned_uid}) created and added to self.users list."
+        )
+        return True, f"用户 '{new_username}' (UID: {assigned_uid}) 创建成功。"
 
     def get_current_user_uid(self) -> Optional[int]:
         return self.current_user.uid if self.current_user else None
@@ -140,45 +184,31 @@ class UserAuthenticator:
             return True
         return False
 
-    # --- 新增：文件描述符管理方法 ---
     def allocate_fd(self, oft_entry: OpenFileEntry) -> int:
-        """为当前用户分配一个新的文件描述符并关联OFT条目。"""
         if not self.current_user:
-            # 实际应用中，如果current_user为None，此方法不应被调用
-            # 或者应该返回一个表示错误的特殊值（如-1）或抛出异常
             print("Error: No user logged in to allocate fd for.")
-            return -1  # 返回-1表示错误
+            return -1
 
-        # 简单的fd分配：查找最小的可用fd，从0开始
         fd_to_assign = 0
         while fd_to_assign in self.current_user_open_files:
             fd_to_assign += 1
 
-        # 如果需要，可以限制最大fd数量或最大打开文件数
-        # if fd_to_assign > MAX_OPEN_FILES_PER_USER:
-        #     return -1 # 或抛出异常
-
         self.current_user_open_files[fd_to_assign] = oft_entry
-        # 更新 _next_fd 不是必须的，如果总是查找最小可用fd
-        # 但如果想让fd大致递增，可以在fd_to_assign >= self._next_fd时更新
-        if fd_to_assign >= self._next_fd:
+        if (
+            fd_to_assign >= self._next_fd
+        ):  # _next_fd 只是一个优化提示，实际分配是查找最小可用
             self._next_fd = fd_to_assign + 1
-
         return fd_to_assign
 
     def get_oft_entry(self, fd: int) -> Optional[OpenFileEntry]:
-        """根据文件描述符获取关联的OFT条目。"""
         if not self.current_user:
             return None
         return self.current_user_open_files.get(fd)
 
     def release_fd(self, fd: int) -> bool:
-        """释放一个文件描述符及其关联的OFT条目。"""
         if not self.current_user:
-            return False  # 或者抛出异常
+            return False
         if fd in self.current_user_open_files:
             del self.current_user_open_files[fd]
-            # 当fd被释放后，_next_fd 不需要改变，因为 allocate_fd 会查找最小可用fd
-            # 如果 _next_fd 用于严格递增且不重用，则此处也不修改
             return True
-        return False  # fd 不存在或不属于当前用户
+        return False
