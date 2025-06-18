@@ -26,6 +26,8 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 import base64
 import os
+import gzip
+import zlib
 
 
 # 加密相关常量
@@ -458,7 +460,7 @@ def write_file(
 
     # 获取文件的inode引用和当前偏移量
     file_inode = oft_entry.inode_ref
-    current_offset = oft_entry.offset  # 通常在“保存”操作前，这个offset会被重置为0
+    current_offset = oft_entry.offset  # 通常在"保存"操作前，这个offset会被重置为0
     block_size = dm.superblock.block_size
 
     bytes_written_this_call = 0
@@ -923,3 +925,602 @@ def _decrypt_data(encrypted_data: bytes, key: bytes) -> bytes:
     """
     f = Fernet(key)
     return f.decrypt(encrypted_data)
+
+
+def create_hard_link(
+    disk: DiskManager,
+    uid: int,
+    parent_inode_id: int,
+    link_name: str,
+    target_inode_id: int,
+) -> Tuple[bool, str, Optional[int]]:
+    """
+    创建硬链接
+    
+    Args:
+        disk: 磁盘管理器
+        uid: 用户ID
+        parent_inode_id: 父目录的i节点ID
+        link_name: 硬链接名称
+        target_inode_id: 目标文件的i节点ID
+    
+    Returns:
+        (成功标志, 消息, 新链接的i节点ID)
+    """
+    try:
+        # 检查目标i节点是否存在
+        target_inode = disk.get_inode(target_inode_id)
+        if not target_inode:
+            return False, f"错误：目标i节点 {target_inode_id} 不存在。", None
+        
+        # 硬链接只能对普通文件创建，不能对目录创建
+        if target_inode.type != FileType.FILE:
+            return False, "错误：只能为普通文件创建硬链接。", None
+        
+        # 检查父目录是否存在
+        parent_inode = disk.get_inode(parent_inode_id)
+        if not parent_inode or parent_inode.type != FileType.DIRECTORY:
+            return False, "错误：父目录不存在或不是目录。", None
+        
+        # 检查权限
+        if not _check_permissions(parent_inode, uid, "write"):
+            return False, "错误：没有在父目录中创建文件的权限。", None
+        
+        # 检查链接名是否已存在
+        success, msg, entries = list_directory(disk, parent_inode_id)
+        if not success:
+            return False, f"错误：无法读取父目录内容：{msg}", None
+        
+        for entry in entries:
+            if entry.get("name") == link_name:
+                return False, f"错误：链接名 '{link_name}' 已存在。", None
+        
+        # 在父目录中添加新的目录项
+        new_entry = DirectoryEntry(name=link_name, inode_id=target_inode_id, is_hardlink=True)
+        
+        # 读取父目录的目录项
+        success, msg, existing_entries = list_directory(disk, parent_inode_id)
+        if not success:
+            return False, f"错误：无法读取父目录：{msg}", None
+        
+        # 添加新条目
+        existing_entries.append(new_entry)
+        
+        # 序列化并写入父目录
+        try:
+            serialized_entries = pickle.dumps(existing_entries)
+            # 检查是否需要额外的数据块
+            if len(serialized_entries) > disk.superblock.block_size:
+                # 需要分配新的数据块
+                new_block_id = disk.allocate_data_block()
+                if new_block_id is None:
+                    return False, "错误：无法分配新的数据块。", None
+                parent_inode.data_block_indices.append(new_block_id)
+                parent_inode.blocks_count += 1
+            
+            # 写入数据块
+            disk.write_block(parent_inode.data_block_indices[0], serialized_entries)
+            
+            # 更新父目录的i节点
+            parent_inode.size = len(existing_entries)
+            parent_inode.mtime = int(time.time())
+            disk.inode_table[parent_inode_id] = parent_inode
+            
+            # 增加目标文件的硬链接计数
+            target_inode.link_count += 1
+            target_inode.ctime = int(time.time())
+            disk.inode_table[target_inode_id] = target_inode
+            
+            return True, f"硬链接 '{link_name}' 创建成功，指向i节点 {target_inode_id}。", target_inode_id
+            
+        except Exception as e:
+            return False, f"错误：序列化或写入目录时出错：{e}", None
+            
+    except Exception as e:
+        return False, f"创建硬链接时出错：{e}", None
+
+
+def delete_file(
+    disk: DiskManager, uid: int, parent_inode_id: int, file_name: str
+) -> Tuple[bool, str]:
+    """
+    删除文件（支持硬链接）
+    
+    Args:
+        disk: 磁盘管理器
+        uid: 用户ID
+        parent_inode_id: 父目录的i节点ID
+        file_name: 要删除的文件名
+    
+    Returns:
+        (成功标志, 消息)
+    """
+    try:
+        # 检查父目录是否存在
+        parent_inode = disk.get_inode(parent_inode_id)
+        if not parent_inode or parent_inode.type != FileType.DIRECTORY:
+            return False, "错误：父目录不存在或不是目录。"
+        
+        # 检查权限
+        if not _check_permissions(parent_inode, uid, "write"):
+            return False, "错误：没有删除文件的权限。"
+        
+        # 查找文件
+        success, msg, entries = list_directory(disk, parent_inode_id)
+        if not success:
+            return False, f"错误：无法读取目录内容：{msg}"
+        
+        target_entry = None
+        target_index = -1
+        
+        for i, entry in enumerate(entries):
+            if entry.get("name") == file_name:
+                target_entry = entry
+                target_index = i
+                break
+        
+        if not target_entry:
+            return False, f"错误：文件 '{file_name}' 不存在。"
+        
+        target_inode_id = target_entry.get("inode_id")
+        target_inode = disk.get_inode(target_inode_id)
+        
+        if not target_inode:
+            return False, f"错误：目标i节点 {target_inode_id} 不存在。"
+        
+        # 检查文件权限
+        if not _check_permissions(target_inode, uid, "write"):
+            return False, "错误：没有删除该文件的权限。"
+        
+        # 从目录中移除条目
+        entries.pop(target_index)
+        
+        # 更新目录
+        try:
+            serialized_entries = pickle.dumps(entries)
+            disk.write_block(parent_inode.data_block_indices[0], serialized_entries)
+            
+            # 更新父目录的i节点
+            parent_inode.size = len(entries)
+            parent_inode.mtime = int(time.time())
+            disk.inode_table[parent_inode_id] = parent_inode
+            
+            # 减少目标文件的硬链接计数
+            target_inode.link_count -= 1
+            target_inode.ctime = int(time.time())
+            
+            # 如果硬链接计数为0，则真正删除文件
+            if target_inode.link_count == 0:
+                # 释放数据块
+                for block_id in target_inode.data_block_indices:
+                    disk.free_data_block(block_id)
+                
+                # 释放间接块
+                for block_id in target_inode.indirect_block_indices:
+                    disk.free_data_block(block_id)
+                
+                for block_id in target_inode.double_indirect_block_indices:
+                    disk.free_data_block(block_id)
+                
+                # 释放i节点
+                disk.free_inode(target_inode_id)
+                return True, f"文件 '{file_name}' 已删除（最后一个硬链接）。"
+            else:
+                # 更新i节点表
+                disk.inode_table[target_inode_id] = target_inode
+                return True, f"硬链接 '{file_name}' 已删除，目标文件仍有 {target_inode.link_count} 个硬链接。"
+            
+        except Exception as e:
+            return False, f"错误：更新目录时出错：{e}"
+            
+    except Exception as e:
+        return False, f"删除文件时出错：{e}"
+
+
+def _check_permissions(inode, uid: int, operation: str) -> bool:
+    """
+    检查权限
+    
+    Args:
+        inode: 要检查的i节点
+        uid: 用户ID
+        operation: 操作类型 ("read", "write", "execute")
+    
+    Returns:
+        是否有权限
+    """
+    # root用户拥有所有权限
+    if uid == 0:
+        return True
+    
+    # 所有者权限
+    if inode.owner_uid == uid:
+        if operation == "read" and (inode.permissions & 0o400):
+            return True
+        elif operation == "write" and (inode.permissions & 0o200):
+            return True
+        elif operation == "execute" and (inode.permissions & 0o100):
+            return True
+    
+    # 组权限（简化实现，实际应该检查用户是否在组中）
+    # 这里暂时跳过组权限检查
+    
+    # 其他用户权限
+    if operation == "read" and (inode.permissions & 0o004):
+        return True
+    elif operation == "write" and (inode.permissions & 0o002):
+        return True
+    elif operation == "execute" and (inode.permissions & 0o001):
+        return True
+    
+    return False
+
+
+def encrypt_file(
+    disk: DiskManager,
+    uid: int,
+    target_inode_id: int,
+    password: str
+) -> Tuple[bool, str]:
+    """
+    加密文件
+    
+    Args:
+        disk: 磁盘管理器
+        uid: 用户ID
+        target_inode_id: 目标文件i节点ID
+        password: 加密密码
+    
+    Returns:
+        (成功标志, 消息)
+    """
+    try:
+        # 检查目标i节点是否存在
+        target_inode = disk.get_inode(target_inode_id)
+        if not target_inode:
+            return False, f"错误：i节点 {target_inode_id} 不存在。"
+        
+        # 只能加密普通文件
+        if target_inode.type != FileType.FILE:
+            return False, "错误：只能加密普通文件。"
+        
+        # 检查权限
+        if not _check_permissions(target_inode, uid, "write"):
+            return False, "错误：没有修改该文件的权限。"
+        
+        # 检查文件是否已经加密
+        if target_inode.is_encrypted:
+            return False, "错误：文件已经加密。"
+        
+        # 读取文件内容
+        success, msg, content = read_file_content(disk, target_inode_id)
+        if not success:
+            return False, f"错误：无法读取文件内容：{msg}"
+        
+        # 生成加密密钥
+        salt = os.urandom(16)
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=salt,
+            iterations=100000,
+        )
+        key = base64.urlsafe_b64encode(kdf.derive(password.encode()))
+        
+        # 加密内容
+        f = Fernet(key)
+        encrypted_content = f.encrypt(content)
+        
+        # 将salt和加密内容一起存储
+        final_content = salt + encrypted_content
+        
+        # 写入加密后的内容
+        success, msg = write_file_content(disk, target_inode_id, final_content)
+        if not success:
+            return False, f"错误：无法写入加密内容：{msg}"
+        
+        # 更新i节点标记
+        target_inode.is_encrypted = True
+        target_inode.ctime = int(time.time())
+        disk.inode_table[target_inode_id] = target_inode
+        
+        return True, "文件加密成功。"
+        
+    except Exception as e:
+        return False, f"加密文件时出错：{e}"
+
+
+def decrypt_file(
+    disk: DiskManager,
+    uid: int,
+    target_inode_id: int,
+    password: str
+) -> Tuple[bool, str]:
+    """
+    解密文件
+    
+    Args:
+        disk: 磁盘管理器
+        uid: 用户ID
+        target_inode_id: 目标文件i节点ID
+        password: 解密密码
+    
+    Returns:
+        (成功标志, 消息)
+    """
+    try:
+        # 检查目标i节点是否存在
+        target_inode = disk.get_inode(target_inode_id)
+        if not target_inode:
+            return False, f"错误：i节点 {target_inode_id} 不存在。"
+        
+        # 只能解密普通文件
+        if target_inode.type != FileType.FILE:
+            return False, "错误：只能解密普通文件。"
+        
+        # 检查权限
+        if not _check_permissions(target_inode, uid, "write"):
+            return False, "错误：没有修改该文件的权限。"
+        
+        # 检查文件是否已经加密
+        if not target_inode.is_encrypted:
+            return False, "错误：文件未加密。"
+        
+        # 读取加密的文件内容
+        success, msg, encrypted_content = read_file_content(disk, target_inode_id)
+        if not success:
+            return False, f"错误：无法读取文件内容：{msg}"
+        
+        # 提取salt和加密内容
+        if len(encrypted_content) < 16:
+            return False, "错误：文件格式不正确。"
+        
+        salt = encrypted_content[:16]
+        actual_encrypted_content = encrypted_content[16:]
+        
+        # 生成解密密钥
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=salt,
+            iterations=100000,
+        )
+        key = base64.urlsafe_b64encode(kdf.derive(password.encode()))
+        
+        # 解密内容
+        f = Fernet(key)
+        try:
+            decrypted_content = f.decrypt(actual_encrypted_content)
+        except Exception:
+            return False, "错误：密码不正确或文件已损坏。"
+        
+        # 写入解密后的内容
+        success, msg = write_file_content(disk, target_inode_id, decrypted_content)
+        if not success:
+            return False, f"错误：无法写入解密内容：{msg}"
+        
+        # 更新i节点标记
+        target_inode.is_encrypted = False
+        target_inode.ctime = int(time.time())
+        disk.inode_table[target_inode_id] = target_inode
+        
+        return True, "文件解密成功。"
+        
+    except Exception as e:
+        return False, f"解密文件时出错：{e}"
+
+
+def compress_file(
+    disk: DiskManager,
+    uid: int,
+    target_inode_id: int,
+    compression_level: int = 6
+) -> Tuple[bool, str]:
+    """
+    压缩文件
+    
+    Args:
+        disk: 磁盘管理器
+        uid: 用户ID
+        target_inode_id: 目标文件i节点ID
+        compression_level: 压缩级别 (1-9)
+    
+    Returns:
+        (成功标志, 消息)
+    """
+    try:
+        # 检查目标i节点是否存在
+        target_inode = disk.get_inode(target_inode_id)
+        if not target_inode:
+            return False, f"错误：i节点 {target_inode_id} 不存在。"
+        
+        # 只能压缩普通文件
+        if target_inode.type != FileType.FILE:
+            return False, "错误：只能压缩普通文件。"
+        
+        # 检查权限
+        if not _check_permissions(target_inode, uid, "write"):
+            return False, "错误：没有修改该文件的权限。"
+        
+        # 检查文件是否已经压缩
+        if target_inode.is_compressed:
+            return False, "错误：文件已经压缩。"
+        
+        # 检查压缩级别
+        if not (1 <= compression_level <= 9):
+            return False, "错误：压缩级别必须在1-9之间。"
+        
+        # 读取文件内容
+        success, msg, content = read_file_content(disk, target_inode_id)
+        if not success:
+            return False, f"错误：无法读取文件内容：{msg}"
+        
+        # 压缩内容
+        compressed_content = zlib.compress(content, compression_level)
+        
+        # 写入压缩后的内容
+        success, msg = write_file_content(disk, target_inode_id, compressed_content)
+        if not success:
+            return False, f"错误：无法写入压缩内容：{msg}"
+        
+        # 更新i节点标记
+        target_inode.is_compressed = True
+        target_inode.compression_level = compression_level
+        target_inode.ctime = int(time.time())
+        disk.inode_table[target_inode_id] = target_inode
+        
+        original_size = len(content)
+        compressed_size = len(compressed_content)
+        compression_ratio = (1 - compressed_size / original_size) * 100
+        
+        return True, f"文件压缩成功。原始大小：{original_size}字节，压缩后：{compressed_size}字节，压缩率：{compression_ratio:.1f}%。"
+        
+    except Exception as e:
+        return False, f"压缩文件时出错：{e}"
+
+
+def decompress_file(
+    disk: DiskManager,
+    uid: int,
+    target_inode_id: int
+) -> Tuple[bool, str]:
+    """
+    解压文件
+    
+    Args:
+        disk: 磁盘管理器
+        uid: 用户ID
+        target_inode_id: 目标文件i节点ID
+    
+    Returns:
+        (成功标志, 消息)
+    """
+    try:
+        # 检查目标i节点是否存在
+        target_inode = disk.get_inode(target_inode_id)
+        if not target_inode:
+            return False, f"错误：i节点 {target_inode_id} 不存在。"
+        
+        # 只能解压普通文件
+        if target_inode.type != FileType.FILE:
+            return False, "错误：只能解压普通文件。"
+        
+        # 检查权限
+        if not _check_permissions(target_inode, uid, "write"):
+            return False, "错误：没有修改该文件的权限。"
+        
+        # 检查文件是否已经压缩
+        if not target_inode.is_compressed:
+            return False, "错误：文件未压缩。"
+        
+        # 读取压缩的文件内容
+        success, msg, compressed_content = read_file_content(disk, target_inode_id)
+        if not success:
+            return False, f"错误：无法读取文件内容：{msg}"
+        
+        # 解压内容
+        try:
+            decompressed_content = zlib.decompress(compressed_content)
+        except Exception:
+            return False, "错误：文件已损坏或不是有效的压缩文件。"
+        
+        # 写入解压后的内容
+        success, msg = write_file_content(disk, target_inode_id, decompressed_content)
+        if not success:
+            return False, f"错误：无法写入解压内容：{msg}"
+        
+        # 更新i节点标记
+        target_inode.is_compressed = False
+        target_inode.compression_level = 0
+        target_inode.ctime = int(time.time())
+        disk.inode_table[target_inode_id] = target_inode
+        
+        return True, "文件解压成功。"
+        
+    except Exception as e:
+        return False, f"解压文件时出错：{e}"
+
+
+def read_file_content(disk: DiskManager, inode_id: int) -> Tuple[bool, str, bytes]:
+    """
+    读取文件内容（支持大文件）
+    
+    Args:
+        disk: 磁盘管理器
+        inode_id: 文件i节点ID
+    
+    Returns:
+        (成功标志, 消息, 文件内容)
+    """
+    try:
+        inode = disk.get_inode(inode_id)
+        if not inode:
+            return False, f"错误：i节点 {inode_id} 不存在。", b""
+        
+        # 获取所有数据块索引
+        block_indices = disk.get_file_block_indices(inode)
+        
+        content = b""
+        for block_id in block_indices:
+            block_data = disk.read_block(block_id)
+            if block_data:
+                content += block_data
+        
+        # 截取到文件实际大小
+        content = content[:inode.size]
+        
+        return True, "读取成功", content
+        
+    except Exception as e:
+        return False, f"读取文件内容时出错：{e}", b""
+
+
+def write_file_content(disk: DiskManager, inode_id: int, content: bytes) -> Tuple[bool, str]:
+    """
+    写入文件内容（支持大文件）
+    
+    Args:
+        disk: 磁盘管理器
+        inode_id: 文件i节点ID
+        content: 要写入的内容
+    
+    Returns:
+        (成功标志, 消息)
+    """
+    try:
+        inode = disk.get_inode(inode_id)
+        if not inode:
+            return False, f"错误：i节点 {inode_id} 不存在。"
+        
+        # 计算需要的块数
+        block_size = disk.superblock.block_size
+        required_blocks = (len(content) + block_size - 1) // block_size
+        
+        # 分配所需的数据块
+        if not disk.allocate_file_blocks(inode, required_blocks):
+            return False, "错误：无法分配足够的数据块。"
+        
+        # 获取所有数据块索引
+        block_indices = disk.get_file_block_indices(inode)
+        
+        # 写入内容到数据块
+        for i, block_id in enumerate(block_indices):
+            start = i * block_size
+            end = start + block_size
+            block_data = content[start:end]
+            
+            # 如果块数据不足一个块大小，用零填充
+            if len(block_data) < block_size:
+                block_data += b'\x00' * (block_size - len(block_data))
+            
+            disk.write_block(block_id, block_data)
+        
+        # 更新i节点
+        inode.size = len(content)
+        inode.mtime = int(time.time())
+        disk.inode_table[inode_id] = inode
+        
+        return True, "写入成功"
+        
+    except Exception as e:
+        return False, f"写入文件内容时出错：{e}"

@@ -1,0 +1,23 @@
+# Python缓存
+__pycache__/
+*.pyc
+*.pyo
+
+# 构建产物
+build/
+dist/
+*.spec
+
+# 日志文件
+filesystem.log
+
+# 虚拟磁盘和大文件
+simulated_disk.img
+
+# IDE相关
+.vscode/
+.idea/
+
+# 其他临时文件
+*.tmp
+*.bak 

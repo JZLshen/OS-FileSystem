@@ -225,3 +225,196 @@ class DiskManager:
         ):
             return None
         return self.inode_table[inode_id]
+
+    def allocate_indirect_block(self) -> Optional[int]:
+        """
+        分配间接块
+        
+        Returns:
+            分配的块ID，失败返回None
+        """
+        return self.allocate_data_block()
+    
+    def allocate_double_indirect_block(self) -> Optional[int]:
+        """
+        分配双重间接块
+        
+        Returns:
+            分配的块ID，失败返回None
+        """
+        return self.allocate_data_block()
+    
+    def read_indirect_block(self, block_id: int) -> List[int]:
+        """
+        读取间接块中的块索引列表
+        
+        Args:
+            block_id: 间接块ID
+        
+        Returns:
+            块索引列表
+        """
+        try:
+            data = self.read_block(block_id)
+            if data:
+                return pickle.loads(data)
+            return []
+        except Exception:
+            return []
+    
+    def write_indirect_block(self, block_id: int, block_indices: List[int]) -> bool:
+        """
+        写入间接块中的块索引列表
+        
+        Args:
+            block_id: 间接块ID
+            block_indices: 块索引列表
+        
+        Returns:
+            是否成功
+        """
+        try:
+            data = pickle.dumps(block_indices)
+            self.write_block(block_id, data)
+            return True
+        except Exception:
+            return False
+    
+    def get_file_block_indices(self, inode) -> List[int]:
+        """
+        获取文件的所有数据块索引（包括间接块）
+        
+        Args:
+            inode: 文件的i节点
+        
+        Returns:
+            所有数据块索引的列表
+        """
+        block_indices = []
+        
+        # 直接块
+        block_indices.extend(inode.data_block_indices)
+        
+        # 间接块
+        for indirect_block_id in inode.indirect_block_indices:
+            indirect_indices = self.read_indirect_block(indirect_block_id)
+            block_indices.extend(indirect_indices)
+        
+        # 双重间接块
+        for double_indirect_block_id in inode.double_indirect_block_indices:
+            double_indirect_indices = self.read_indirect_block(double_indirect_block_id)
+            for indirect_block_id in double_indirect_indices:
+                indirect_indices = self.read_indirect_block(indirect_block_id)
+                block_indices.extend(indirect_indices)
+        
+        return block_indices
+    
+    def allocate_file_blocks(self, inode, required_blocks: int) -> bool:
+        """
+        为文件分配所需的数据块
+        
+        Args:
+            inode: 文件的i节点
+            required_blocks: 需要的块数量
+        
+        Returns:
+            是否成功
+        """
+        try:
+            # 计算还需要多少块
+            current_blocks = len(inode.data_block_indices)
+            for indirect_block_id in inode.indirect_block_indices:
+                indirect_indices = self.read_indirect_block(indirect_block_id)
+                current_blocks += len(indirect_indices)
+            for double_indirect_block_id in inode.double_indirect_block_indices:
+                double_indirect_indices = self.read_indirect_block(double_indirect_block_id)
+                for indirect_block_id in double_indirect_indices:
+                    indirect_indices = self.read_indirect_block(indirect_block_id)
+                    current_blocks += len(indirect_indices)
+            
+            needed_blocks = required_blocks - current_blocks
+            if needed_blocks <= 0:
+                return True
+            
+            # 优先使用直接块
+            direct_blocks_needed = min(needed_blocks, 12 - len(inode.data_block_indices))
+            for _ in range(direct_blocks_needed):
+                block_id = self.allocate_data_block()
+                if block_id is None:
+                    return False
+                inode.data_block_indices.append(block_id)
+                inode.blocks_count += 1
+            
+            needed_blocks -= direct_blocks_needed
+            if needed_blocks <= 0:
+                return True
+            
+            # 使用间接块
+            blocks_per_indirect = self.superblock.block_size // 4  # 假设块索引是4字节
+            
+            while needed_blocks > 0:
+                # 检查是否需要新的间接块
+                if len(inode.indirect_block_indices) == 0 or \
+                   len(self.read_indirect_block(inode.indirect_block_indices[-1])) >= blocks_per_indirect:
+                    # 分配新的间接块
+                    new_indirect_block = self.allocate_indirect_block()
+                    if new_indirect_block is None:
+                        return False
+                    inode.indirect_block_indices.append(new_indirect_block)
+                    inode.blocks_count += 1
+                
+                # 在最后一个间接块中添加块索引
+                last_indirect_block_id = inode.indirect_block_indices[-1]
+                indirect_indices = self.read_indirect_block(last_indirect_block_id)
+                
+                block_id = self.allocate_data_block()
+                if block_id is None:
+                    return False
+                
+                indirect_indices.append(block_id)
+                self.write_indirect_block(last_indirect_block_id, indirect_indices)
+                inode.blocks_count += 1
+                needed_blocks -= 1
+            
+            return True
+            
+        except Exception:
+            return False
+    
+    def free_file_blocks(self, inode) -> None:
+        """
+        释放文件的所有数据块
+        
+        Args:
+            inode: 文件的i节点
+        """
+        try:
+            # 释放直接块
+            for block_id in inode.data_block_indices:
+                self.free_data_block(block_id)
+            
+            # 释放间接块
+            for indirect_block_id in inode.indirect_block_indices:
+                # 先释放间接块指向的数据块
+                indirect_indices = self.read_indirect_block(indirect_block_id)
+                for block_id in indirect_indices:
+                    self.free_data_block(block_id)
+                # 再释放间接块本身
+                self.free_data_block(indirect_block_id)
+            
+            # 释放双重间接块
+            for double_indirect_block_id in inode.double_indirect_block_indices:
+                # 先释放双重间接块指向的间接块
+                double_indirect_indices = self.read_indirect_block(double_indirect_block_id)
+                for indirect_block_id in double_indirect_indices:
+                    # 释放间接块指向的数据块
+                    indirect_indices = self.read_indirect_block(indirect_block_id)
+                    for block_id in indirect_indices:
+                        self.free_data_block(block_id)
+                    # 释放间接块本身
+                    self.free_data_block(indirect_block_id)
+                # 再释放双重间接块本身
+                self.free_data_block(double_indirect_block_id)
+                
+        except Exception:
+            pass

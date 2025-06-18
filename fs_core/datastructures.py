@@ -29,35 +29,35 @@ class Inode:
         file_type: FileType,
         owner_uid: int,
         permissions: int = (Permissions.READ | Permissions.WRITE),
+        group_id: int = 0,  # 新增：所属组ID
+        is_encrypted: bool = False,  # 新增：加密标记
+        is_compressed: bool = False,  # 新增：压缩标记
     ):
         self.id: int = inode_id  # i节点编号
         self.type: FileType = file_type  # 文件类型 (FILE 或 DIRECTORY)
         self.size: int = 0  # 文件大小 (字节) / 目录中条目数 (一种可能的实现)
         self.blocks_count: int = 0  # 占用的数据块数量
-        self.data_block_indices: List[int] = (
-            []
-        )  # 指向数据块的索引列表 (直接寻址，简化模型)
-        # 对于大文件，未来可扩展为间接寻址
-
+        self.data_block_indices: List[int] = []  # 直接块索引
+        self.indirect_block_indices: List[int] = []  # 新增：单级间接块索引
+        self.double_indirect_block_indices: List[int] = []  # 新增：双级间接块索引
         self.owner_uid: int = owner_uid  # 所有者用户ID
+        self.group_id: int = group_id  # 新增：所属组ID
         self.permissions: int = permissions  # 权限 (简化版)
-
         current_time = int(time.time())
         self.atime: int = current_time  # 最后访问时间 (access time)
         self.mtime: int = (
             current_time  # 最后修改时间 (modification time) - 文件内容修改
         )
         self.ctime: int = current_time  # 最后状态更改时间 (change time) - 元数据修改
-
         self.link_count: int = 1  # 硬链接计数 (用于删除文件/目录)
-
-        self.is_encrypted: bool = False  # 文件是否加密的标记
+        self.is_encrypted: bool = is_encrypted  # 新增：加密标记
+        self.is_compressed: bool = is_compressed  # 新增：压缩标记
 
     def __repr__(self) -> str:
         return (
             f"Inode(id={self.id}, type='{self.type.name}', size={self.size}, "
-            f"owner_uid={self.owner_uid}, permissions={oct(self.permissions)}, "
-            f"links={self.link_count})"
+            f"owner_uid={self.owner_uid}, group_id={self.group_id}, permissions={oct(self.permissions)}, "
+            f"links={self.link_count}, encrypted={self.is_encrypted}, compressed={self.is_compressed})"
         )
 
 
@@ -66,7 +66,7 @@ class DirectoryEntry:
     目录项 (用于在目录的数据块中存储条目)
     """
 
-    def __init__(self, name: str, inode_id: int):
+    def __init__(self, name: str, inode_id: int, is_hardlink: bool = False):
         if "/" in name:  # 简单检查，目录项名不应包含路径分隔符
             raise ValueError("DirectoryEntry name cannot contain '/'")
         if len(name) > 255:  # 简单文件名长度限制
@@ -74,9 +74,10 @@ class DirectoryEntry:
 
         self.name: str = name  # 文件或目录名
         self.inode_id: int = inode_id  # 指向该文件或目录的i节点编号
+        self.is_hardlink: bool = is_hardlink  # 新增：是否为硬链接
 
     def __repr__(self) -> str:
-        return f"DirectoryEntry(name='{self.name}', inode_id={self.inode_id})"
+        return f"DirectoryEntry(name='{self.name}', inode_id={self.inode_id}, is_hardlink={self.is_hardlink})"
 
 
 class Superblock:
@@ -119,7 +120,7 @@ class OpenMode(Enum):
 class OpenFileEntry:
     """
     打开文件表中的条目 (OFT Entry)
-    这个条目将由用户的“文件描述符表”直接持有。
+    这个条目将由用户的"文件描述符表"直接持有。
     """
 
     def __init__(

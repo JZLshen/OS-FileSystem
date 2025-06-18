@@ -21,18 +21,22 @@ class User:
 
     def __init__(
         self,
-        uid: int,
         username: str,
-        password_hash: str,
+        password: str,
+        uid: int,
+        group_id: int = 0,
+        is_admin: bool = False,
         home_inode_id: Optional[int] = None,
     ):
-        self.uid: int = uid
-        self.username: str = username
-        self.password_hash: str = password_hash
-        self.home_inode_id: Optional[int] = home_inode_id
+        self.username = username
+        self.password = password
+        self.uid = uid
+        self.group_id = group_id
+        self.is_admin = is_admin
+        self.home_inode_id = home_inode_id
 
     def __repr__(self) -> str:
-        return f"User(uid={self.uid}, username='{self.username}', home_inode_id={self.home_inode_id})"
+        return f"User(uid={self.uid}, username='{self.username}', group_id={self.group_id}, is_admin={self.is_admin})"
 
 
 class UserAuthenticator:
@@ -54,10 +58,12 @@ class UserAuthenticator:
         """加载/初始化默认用户"""
         for username, data in DEFAULT_USERS_DATA.items():
             self.users[username] = User(
-                uid=data["uid"],
                 username=username,
-                password_hash=data["password"],
-                home_inode_id=data["home_inode_id"],
+                password=data["password"],
+                uid=data["uid"],
+                group_id=0,
+                is_admin=False,
+                home_inode_id=data.get("home_inode_id"),
             )
         print(f"Initialized users: {list(self.users.keys())}")
 
@@ -77,7 +83,7 @@ class UserAuthenticator:
         if not user:
             return False, f"Login failed: User '{username}' not found."
 
-        if user.password_hash == password_plaintext:
+        if user.password == password_plaintext:
             self.current_user = user
             if user.uid == ROOT_UID and root_inode_id is not None:
                 self.current_user_cwd_inode_id = root_inode_id
@@ -117,55 +123,48 @@ class UserAuthenticator:
 
     def create_user(
         self,
-        new_username: str,
-        new_password_plaintext: str,
-        new_uid: Optional[int] = None,
-        new_home_inode_id: Optional[int] = None,
+        username: str,
+        password: str,
+        group_id: int = 0,
+        is_admin: bool = False,
     ) -> Tuple[bool, str]:
-        if not new_username:
+        if not username:
             return False, "错误：用户名不能为空。"
-        if new_username in self.users:
-            return False, f"错误：用户 '{new_username}' 已存在。"
+        if username in self.users:
+            return False, f"错误：用户 '{username}' 已存在。"
 
         assigned_uid: int
         existing_uids = {user.uid for user in self.users.values()}
 
-        if new_uid is not None:
-            if new_uid in existing_uids:
-                return False, f"错误：UID {new_uid} 已被占用。"
-            assigned_uid = new_uid
+        if not existing_uids:  # 如果除了默认用户外没有其他用户了
+            assigned_uid = 1000
         else:
-            # 自动分配 UID, 确保不与 ROOT_UID 冲突且从 1000 开始（如果可能）
-            candidate_uid = 1000
-            if not existing_uids:  # 如果除了默认用户外没有其他用户了
-                pass  # candidate_uid is 1000
-            else:
-                # 确保从现有最大非root UID之后开始，或者至少是1000
-                max_non_root_uid = 0
-                for uid_val in existing_uids:
-                    if uid_val != ROOT_UID and uid_val > max_non_root_uid:
-                        max_non_root_uid = uid_val
-                candidate_uid = max(1000, max_non_root_uid + 1)
+            # 确保从现有最大非root UID之后开始，或者至少是1000
+            max_non_root_uid = 0
+            for uid_val in existing_uids:
+                if uid_val != ROOT_UID and uid_val > max_non_root_uid:
+                    max_non_root_uid = uid_val
+            assigned_uid = max(1000, max_non_root_uid + 1)
 
-            while candidate_uid in existing_uids or candidate_uid == ROOT_UID:
-                candidate_uid += 1
-            assigned_uid = candidate_uid
+        while assigned_uid in existing_uids or assigned_uid == ROOT_UID:
+            assigned_uid += 1
 
         # 实际应用中，密码应哈希存储
-        # password_hash_to_store = some_hash_function(new_password_plaintext)
-        password_hash_to_store = new_password_plaintext  # 保持项目当前简化逻辑
+        # password_hash_to_store = some_hash_function(password)
+        password_hash_to_store = password  # 保持项目当前简化逻辑
 
-        new_user = User(
+        user = User(
+            username=username,
+            password=password_hash_to_store,
             uid=assigned_uid,
-            username=new_username,
-            password_hash=password_hash_to_store,
-            home_inode_id=new_home_inode_id,  # 通常在创建用户后，再单独创建家目录并更新此值
+            group_id=group_id,
+            is_admin=is_admin,
         )
-        self.users[new_username] = new_user
+        self.users[username] = user
         print(
-            f"User '{new_username}' (UID: {assigned_uid}) created and added to self.users list."
+            f"User '{username}' (UID: {assigned_uid}) created and added to self.users list."
         )
-        return True, f"用户 '{new_username}' (UID: {assigned_uid}) 创建成功。"
+        return True, f"用户 '{username}' (UID: {assigned_uid}) 创建成功。"
 
     def get_current_user_uid(self) -> Optional[int]:
         return self.current_user.uid if self.current_user else None
@@ -212,3 +211,7 @@ class UserAuthenticator:
             del self.current_user_open_files[fd]
             return True
         return False
+
+
+# 为了向后兼容，创建一个别名
+UserAuth = UserAuthenticator
