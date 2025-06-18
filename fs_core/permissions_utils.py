@@ -3,37 +3,151 @@ import time
 from typing import Tuple, Optional
 from .datastructures import FileType
 from .disk_manager import DiskManager
+from user_management.user_auth import ROOT_UID
 
 
-def check_permission(inode: Inode, user_uid: int, required_permission: int) -> bool:
+def check_permission(inode: Inode, user_uid: int, operation: str) -> bool:
     """
-    检查用户对inode是否拥有所需权限。
+    检查用户是否有权限执行指定操作
+    
     Args:
-        inode: 目标文件的 Inode 对象。
-        user_uid: 当前用户的 UID。
-        required_permission: 所需的权限位 (例如 Permissions.READ, Permissions.WRITE)。
+        inode: 目标i节点
+        user_uid: 用户UID
+        operation: 操作类型 ('read', 'write', 'execute', 'delete')
+    
     Returns:
-        bool: True 如果有权限, False 如果没有。
+        bool: 是否有权限
     """
-    if user_uid == 0:  # root 用户总是有权限
+    # root用户拥有所有权限
+    if user_uid == ROOT_UID:
         return True
+    
+    # 所有者权限检查
+    if inode.owner_uid == user_uid:
+        return _check_owner_permission(inode, operation)
+    
+    # 其他用户权限检查
+    return _check_other_permission(inode, operation)
 
-    if inode.owner_uid == user_uid:  # 文件所有者
-        # 检查所有者权限位
-        # 假设 inode.permissions 是一个整数，例如 0o754 (rwxr-xr--)
-        # 例如，所有者权限在最高的3位: (inode.permissions >> 6) & required_permission == required_permission
-        owner_perms = (inode.permissions >> 6) & 0b111
-        if (owner_perms & required_permission) == required_permission:
-            return True
-    # (如果引入了组的概念，在这里添加组权限检查)
-    else:  # 其他用户
-        # 检查其他用户权限位
-        # 例如，其他用户权限在最低的3位: (inode.permissions & 0b000111) & required_permission == required_permission
-        other_perms = inode.permissions & 0b111
-        if (other_perms & required_permission) == required_permission:
-            return True
 
-    return False
+def _check_owner_permission(inode: Inode, operation: str) -> bool:
+    """检查所有者权限"""
+    permissions = inode.permissions
+    
+    if operation == 'read':
+        return bool(permissions & (Permissions.READ << 6))
+    elif operation == 'write':
+        return bool(permissions & (Permissions.WRITE << 6))
+    elif operation == 'execute':
+        return bool(permissions & (Permissions.EXECUTE << 6))
+    elif operation == 'delete':
+        # 删除需要写权限
+        return bool(permissions & (Permissions.WRITE << 6))
+    else:
+        return False
+
+
+def _check_other_permission(inode: Inode, operation: str) -> bool:
+    """检查其他用户权限"""
+    permissions = inode.permissions
+    
+    if operation == 'read':
+        return bool(permissions & Permissions.READ)
+    elif operation == 'write':
+        return bool(permissions & Permissions.WRITE)
+    elif operation == 'execute':
+        return bool(permissions & Permissions.EXECUTE)
+    elif operation == 'delete':
+        # 删除需要写权限
+        return bool(permissions & Permissions.WRITE)
+    else:
+        return False
+
+
+def can_read_file(inode: Inode, user_uid: int) -> bool:
+    """检查是否可以读取文件"""
+    return check_permission(inode, user_uid, 'read')
+
+
+def can_write_file(inode: Inode, user_uid: int) -> bool:
+    """检查是否可以写入文件"""
+    return check_permission(inode, user_uid, 'write')
+
+
+def can_execute_file(inode: Inode, user_uid: int) -> bool:
+    """检查是否可以执行文件"""
+    return check_permission(inode, user_uid, 'execute')
+
+
+def can_delete_file(inode: Inode, user_uid: int) -> bool:
+    """检查是否可以删除文件"""
+    return check_permission(inode, user_uid, 'delete')
+
+
+def can_access_directory(inode: Inode, user_uid: int) -> bool:
+    """检查是否可以访问目录"""
+    return check_permission(inode, user_uid, 'execute')
+
+
+def can_modify_directory(inode: Inode, user_uid: int) -> bool:
+    """检查是否可以修改目录（创建/删除文件）"""
+    return check_permission(inode, user_uid, 'write')
+
+
+def get_permission_string(permissions: int) -> str:
+    """将权限数字转换为字符串表示"""
+    def get_perm_char(perm_bits: int) -> str:
+        chars = []
+        chars.append('r' if perm_bits & Permissions.READ else '-')
+        chars.append('w' if perm_bits & Permissions.WRITE else '-')
+        chars.append('x' if perm_bits & Permissions.EXECUTE else '-')
+        return ''.join(chars)
+    
+    owner_perm = (permissions >> 6) & 0b111
+    group_perm = (permissions >> 3) & 0b111
+    other_perm = permissions & 0b111
+    
+    return f"{get_perm_char(owner_perm)}{get_perm_char(group_perm)}{get_perm_char(other_perm)}"
+
+
+def set_permission(inode: Inode, user_uid: int, new_permissions: int) -> bool:
+    """
+    设置文件权限
+    
+    Args:
+        inode: 目标i节点
+        user_uid: 执行操作的用户UID
+        new_permissions: 新的权限值
+    
+    Returns:
+        bool: 是否设置成功
+    """
+    # 只有所有者或root可以修改权限
+    if user_uid != ROOT_UID and inode.owner_uid != user_uid:
+        return False
+    
+    inode.permissions = new_permissions
+    return True
+
+
+def change_owner(inode: Inode, current_user_uid: int, new_owner_uid: int) -> bool:
+    """
+    更改文件所有者
+    
+    Args:
+        inode: 目标i节点
+        current_user_uid: 执行操作的用户UID
+        new_owner_uid: 新的所有者UID
+    
+    Returns:
+        bool: 是否更改成功
+    """
+    # 只有root可以更改所有者
+    if current_user_uid != ROOT_UID:
+        return False
+    
+    inode.owner_uid = new_owner_uid
+    return True
 
 
 def chmod(

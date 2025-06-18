@@ -3,7 +3,9 @@ import pickle
 from typing import Tuple, Optional, List, Dict, Any
 from .disk_manager import DiskManager
 from .datastructures import Inode, DirectoryEntry, FileType, Permissions
-from .permissions_utils import check_permission
+from .permissions_utils import (
+    check_permission, can_access_directory, can_modify_directory, can_delete_file
+)
 
 # NOTE: The import of 'delete_file' is moved inside the 'remove_directory' function to prevent circular import.
 
@@ -171,6 +173,13 @@ def make_directory(
             None,
         )
 
+    if not can_modify_directory(parent_inode, current_user_uid):
+        return (
+            False,
+            f"Error: Permission denied. User {current_user_uid} cannot create directories in parent (inode {parent_inode_id}).",
+            None,
+        )
+
     parent_entries = _read_directory_entries(dm, parent_inode_id)
     if parent_entries is None:
         return (
@@ -209,14 +218,22 @@ def make_directory(
 
     dot_entry = DirectoryEntry(name=".", inode_id=new_inode_id)
     dot_dot_entry = DirectoryEntry(name="..", inode_id=parent_inode_id)
-    if not _write_directory_entries(dm, new_inode_id, [dot_entry, dot_dot_entry]):
+    dir_entries = [dot_entry, dot_dot_entry]
+    new_dir_inode.size = len(dir_entries)
+
+    try:
+        serialized_entries = pickle.dumps(dir_entries)
+        if len(serialized_entries) > dm.superblock.block_size:
+            dm.free_data_block(new_data_block_id)
+            dm.free_inode(new_inode_id)
+            return False, "Error: Directory entries too large for a single block.", None
+
+        dm.write_block(new_data_block_id, serialized_entries)
+
+    except Exception as e:
         dm.free_data_block(new_data_block_id)
         dm.free_inode(new_inode_id)
-        return (
-            False,
-            f"Error: Failed to write entries for new directory (inode {new_inode_id}).",
-            None,
-        )
+        return False, f"Error creating directory entries: {e}.", None
 
     new_entry_for_parent = DirectoryEntry(name=new_dir_name, inode_id=new_inode_id)
     parent_entries.append(new_entry_for_parent)
@@ -225,12 +242,13 @@ def make_directory(
         dm.free_inode(new_inode_id)
         return (
             False,
-            f"Error: Failed to update parent directory (inode {parent_inode_id}).",
+            f"Error: Failed to update parent directory (inode {parent_inode_id}) with new directory entry.",
             None,
         )
 
-    parent_inode.link_count += 1
-    parent_inode.mtime = parent_inode.ctime = parent_inode.atime = current_timestamp
+    parent_inode.mtime = current_timestamp
+    parent_inode.ctime = current_timestamp
+    parent_inode.atime = current_timestamp
 
     return (
         True,
@@ -253,6 +271,12 @@ def remove_directory(
     parent_inode = dm.get_inode(parent_inode_id)
     if not parent_inode or parent_inode.type != FileType.DIRECTORY:
         return False, f"Error: Parent (inode {parent_inode_id}) is not a directory."
+
+    if not can_modify_directory(parent_inode, current_user_uid):
+        return (
+            False,
+            f"Error: Permission denied. User {current_user_uid} cannot delete directories in parent (inode {parent_inode_id}).",
+        )
 
     parent_entries = _read_directory_entries(dm, parent_inode_id)
     if parent_entries is None:
@@ -285,6 +309,12 @@ def remove_directory(
         return (
             False,
             f"Error: '{dir_name_to_delete}' is not a directory. Use 'rm' for files.",
+        )
+
+    if not can_delete_file(target_dir_inode, current_user_uid):
+        return (
+            False,
+            f"Error: Permission denied. User {current_user_uid} cannot delete directory '{dir_name_to_delete}'.",
         )
 
     target_dir_entries = _read_directory_entries(dm, target_dir_inode_id)
@@ -379,7 +409,7 @@ def list_directory(
                 "inode_id": entry.inode_id,
                 "type": entry_inode.type.name,
                 "size": entry_inode.size,
-                "permissions": oct(entry_inode.permissions),
+                "permissions": entry_inode.permissions,
                 "mtime": entry_inode.mtime,
                 "link_count": entry_inode.link_count,
                 "owner_uid": entry_inode.owner_uid,

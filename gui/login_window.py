@@ -80,6 +80,8 @@ class LoginWindow(QDialog):
 
         if not username or not password:
             self.message_label.setText("<font color='red'>用户名和密码不能为空!</font>")
+            self.pass_input.clear()
+            self.pass_input.setFocus()
             return
 
         if self.user_auth:
@@ -119,6 +121,9 @@ class LoginWindow(QDialog):
             else:
                 self.message_label.setText(f"<font color='red'>{message}</font>")
                 self.pass_input.clear()  # 登录失败，清空密码框
+                self.pass_input.setFocus()  # 聚焦到密码框
+                # 添加震动效果提示用户
+                self._shake_window()
         else:
             # 这是UserAuthenticator实例未传递的情况，用于独立测试UI
             self.message_label.setText(
@@ -135,6 +140,32 @@ class LoginWindow(QDialog):
                     "<font color='red'>模拟登录失败 (请输入 test/test)</font>"
                 )
                 self.pass_input.clear()
+                self.pass_input.setFocus()
+
+    def _shake_window(self):
+        """窗口震动效果，提示用户登录失败"""
+        import time
+        original_pos = self.pos()
+        
+        # 简单的震动效果
+        for i in range(3):
+            self.move(original_pos.x() + 5, original_pos.y())
+            QApplication.processEvents()
+            time.sleep(0.05)
+            self.move(original_pos.x() - 5, original_pos.y())
+            QApplication.processEvents()
+            time.sleep(0.05)
+        
+        self.move(original_pos.x(), original_pos.y())
+
+    def keyPressEvent(self, event):
+        """处理键盘事件"""
+        if event.key() == Qt.Key.Key_Escape:
+            self.close()
+        elif event.key() == Qt.Key.Key_Return or event.key() == Qt.Key.Key_Enter:
+            self.handle_login()
+        else:
+            super().keyPressEvent(event)
 
 
 # 这部分用于独立测试 LoginWindow UI，实际应用中它会被主程序调用

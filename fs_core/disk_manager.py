@@ -217,6 +217,8 @@ class DiskManager:
         return self.data_blocks[block_id]
 
     def get_inode(self, inode_id: int) -> Optional[Inode]:
+        if inode_id is None:
+            return None
         if (
             not self.is_formatted
             or inode_id < 0

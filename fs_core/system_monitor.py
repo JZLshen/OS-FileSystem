@@ -123,6 +123,9 @@ class SystemMonitor:
         self.lock = threading.RLock()
         self.callbacks: List[Callable[[SystemMetrics], None]] = []
         
+        # 添加健康检查器
+        self.health_checker = HealthChecker(disk_manager, cache_manager)
+        
     def start_monitoring(self) -> None:
         """开始监控"""
         if self.is_monitoring:

@@ -29,6 +29,11 @@ import os
 import gzip
 import zlib
 
+from .permissions_utils import (
+    can_read_file, can_write_file, can_delete_file, 
+    can_access_directory, can_modify_directory
+)
+
 
 # 加密相关常量
 ENCRYPTION_SALT = b"file_system_salt"  # 实际部署时应使用随机生成的salt
@@ -1343,7 +1348,7 @@ def compress_file(
             return False, "错误：没有修改该文件的权限。"
         
         # 检查文件是否已经压缩
-        if target_inode.is_compressed:
+        if getattr(target_inode, 'is_compressed', False):
             return False, "错误：文件已经压缩。"
         
         # 检查压缩级别
@@ -1410,7 +1415,7 @@ def decompress_file(
             return False, "错误：没有修改该文件的权限。"
         
         # 检查文件是否已经压缩
-        if not target_inode.is_compressed:
+        if not getattr(target_inode, 'is_compressed', False):
             return False, "错误：文件未压缩。"
         
         # 读取压缩的文件内容
@@ -1457,14 +1462,18 @@ def read_file_content(disk: DiskManager, inode_id: int) -> Tuple[bool, str, byte
         if not inode:
             return False, f"错误：i节点 {inode_id} 不存在。", b""
         
-        # 获取所有数据块索引
-        block_indices = disk.get_file_block_indices(inode)
+        # 获取所有数据块索引（只使用直接块，简化实现）
+        block_indices = getattr(inode, 'data_block_indices', [])
         
         content = b""
         for block_id in block_indices:
-            block_data = disk.read_block(block_id)
-            if block_data:
-                content += block_data
+            try:
+                block_data = disk.read_block(block_id)
+                if block_data:
+                    content += bytes(block_data)
+            except Exception as e:
+                print(f"读取块 {block_id} 失败: {e}")
+                continue
         
         # 截取到文件实际大小
         content = content[:inode.size]
@@ -1496,15 +1505,21 @@ def write_file_content(disk: DiskManager, inode_id: int, content: bytes) -> Tupl
         block_size = disk.superblock.block_size
         required_blocks = (len(content) + block_size - 1) // block_size
         
-        # 分配所需的数据块
-        if not disk.allocate_file_blocks(inode, required_blocks):
-            return False, "错误：无法分配足够的数据块。"
+        # 清空现有数据块
+        existing_blocks = getattr(inode, 'data_block_indices', [])
+        for block_id in existing_blocks:
+            disk.free_data_block(block_id)
         
-        # 获取所有数据块索引
-        block_indices = disk.get_file_block_indices(inode)
+        # 重新分配数据块
+        inode.data_block_indices = []
+        for i in range(required_blocks):
+            block_id = disk.allocate_data_block()
+            if block_id is None:
+                return False, "错误：无法分配足够的数据块。"
+            inode.data_block_indices.append(block_id)
         
         # 写入内容到数据块
-        for i, block_id in enumerate(block_indices):
+        for i, block_id in enumerate(inode.data_block_indices):
             start = i * block_size
             end = start + block_size
             block_data = content[start:end]
@@ -1517,6 +1532,7 @@ def write_file_content(disk: DiskManager, inode_id: int, content: bytes) -> Tupl
         
         # 更新i节点
         inode.size = len(content)
+        inode.blocks_count = len(inode.data_block_indices)
         inode.mtime = int(time.time())
         disk.inode_table[inode_id] = inode
         

@@ -119,6 +119,56 @@ class PropertiesDialog(QDialog):
         add_read_only_row("链接数:", str(item_details.get("link_count", "N/A")))
         add_read_only_row("占用块数:", str(item_details.get("blocks_count", "N/A")))
 
+        # 新增：加密和压缩状态
+        is_encrypted = item_details.get("is_encrypted", False)
+        is_compressed = item_details.get("is_compressed", False)
+        add_read_only_row("加密状态:", "是" if is_encrypted else "否")
+        add_read_only_row("压缩状态:", "是" if is_compressed else "否")
+
+        # 新增：文件系统信息
+        add_read_only_row("文件系统:", "模拟UNIX文件系统")
+        add_read_only_row("块大小:", str(item_details.get("block_size", "512")) + " 字节")
+
+        # 新增：访问统计
+        access_count = item_details.get("access_count", 0)
+        add_read_only_row("访问次数:", str(access_count))
+
+        # 新增：创建时间（如果有）
+        ctime = item_details.get("ctime", 0)
+        if ctime > 0:
+            add_read_only_row("创建时间:", format_time(ctime))
+
+        # 新增：文件类型详细信息
+        file_type = item_details.get("type", "未知")
+        if file_type == "DIRECTORY":
+            add_read_only_row("目录项数:", str(item_details.get("size", 0)))
+        elif file_type == "SYMBOLIC_LINK":
+            target_path = item_details.get("target_path", "N/A")
+            add_read_only_row("目标路径:", target_path)
+        else:
+            add_read_only_row("文件类型:", "普通文件")
+
+        # 新增：权限详细信息
+        permissions = item_details.get("permissions", 0o644)
+        owner_perms = (permissions >> 6) & 0b111
+        group_perms = (permissions >> 3) & 0b111
+        other_perms = permissions & 0b111
+        
+        perm_details = f"所有者: {oct(owner_perms)[2:]} 组: {oct(group_perms)[2:]} 其他: {oct(other_perms)[2:]}"
+        add_read_only_row("权限详情:", perm_details)
+
+        # 新增：文件状态
+        status_items = []
+        if is_encrypted:
+            status_items.append("已加密")
+        if is_compressed:
+            status_items.append("已压缩")
+        if item_details.get("is_hardlink", False):
+            status_items.append("硬链接")
+        if not status_items:
+            status_items.append("正常")
+        add_read_only_row("文件状态:", ", ".join(status_items))
+
         button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok)
         button_box.accepted.connect(self.accept)
         main_layout.addWidget(button_box)

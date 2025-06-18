@@ -198,25 +198,23 @@ class TextEditorDialog(QDialog):
         )
 
         if success_write:
+            QMessageBox.information(self, "保存成功", f"文件已保存，共写入 {bytes_written} 字节。")
             self.text_edit.document().setModified(False)
             self.original_content_on_edit_start = current_content_str
-
-            save_success_pm = self.pm.save_disk_image(self.dm)
-            if not save_success_pm:
-                QMessageBox.warning(
-                    self, "持久化警告", "文件内容已写入内存，但保存到磁盘镜像失败。"
-                )
-
-            QMessageBox.information(
-                self, "保存成功", f"文件 '{self.file_name}' 已保存。"
-            )
+            
+            # 强制关闭文件描述符，避免资源泄漏
+            if self.fd is not None:
+                close_file(self.auth, self.fd)
+                self.fd = None
+            
             return True
         else:
-            QMessageBox.critical(self, "保存失败", f"无法保存文件: {msg_write}")
+            QMessageBox.critical(self, "保存失败", f"写入文件失败: {msg_write}")
             return False
 
     def closeEvent(self, event: QCloseEvent):
-        if self.is_edit_mode and self.text_edit.document().isModified():
+        """窗口关闭事件处理"""
+        if self.text_edit.document().isModified():
             reply = QMessageBox.question(
                 self,
                 "未保存的更改",
@@ -227,23 +225,40 @@ class TextEditorDialog(QDialog):
             )
             if reply == QMessageBox.StandardButton.Save:
                 if not self._save_file():
-                    event.ignore()
+                    event.ignore()  # 保存失败，阻止关闭
                     return
             elif reply == QMessageBox.StandardButton.Cancel:
-                event.ignore()
+                event.ignore()  # 取消关闭
                 return
 
+        # 确保关闭文件描述符
         if self.fd is not None:
-            success_close, msg_close = close_file(self.auth, self.fd)
-            if not success_close:
-                QMessageBox.warning(
-                    self, "关闭文件警告", f"关闭文件描述符时发生错误: {msg_close}"
-                )
+            close_file(self.auth, self.fd)
             self.fd = None
+
         event.accept()
 
     def reject(self):
-        # QWidget.close() 会发送一个QCloseEvent, 触发我们的closeEvent方法
-        # 如果closeEvent接受了事件 (event.accept()), self.close() 返回 True
-        if self.close():
-            super().reject()  # 只有当窗口确实要关闭时，才调用父类的reject
+        """拒绝对话框（关闭按钮）"""
+        # 检查是否有未保存的更改
+        if self.text_edit.document().isModified():
+            reply = QMessageBox.question(
+                self,
+                "未保存的更改",
+                "您有未保存的更改。要保存吗？",
+                QMessageBox.StandardButton.Save
+                | QMessageBox.StandardButton.Discard
+                | QMessageBox.StandardButton.Cancel,
+            )
+            if reply == QMessageBox.StandardButton.Save:
+                if not self._save_file():
+                    return  # 保存失败，不关闭
+            elif reply == QMessageBox.StandardButton.Cancel:
+                return  # 取消关闭
+
+        # 确保关闭文件描述符
+        if self.fd is not None:
+            close_file(self.auth, self.fd)
+            self.fd = None
+
+        super().reject()

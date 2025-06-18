@@ -93,7 +93,19 @@ class ErrorHandler:
                   file_path: Optional[str] = None) -> ErrorRecord:
         """记录错误"""
         with self.lock:
-            # 创建错误记录
+            # 确保severity和category是枚举类型
+            if isinstance(severity, str):
+                try:
+                    severity = ErrorSeverity(severity)
+                except ValueError:
+                    severity = ErrorSeverity.ERROR
+            
+            if isinstance(category, str):
+                try:
+                    category = ErrorCategory(category)
+                except ValueError:
+                    category = ErrorCategory.SYSTEM
+            
             error_record = ErrorRecord(
                 timestamp=datetime.now(),
                 severity=severity,
