@@ -51,6 +51,8 @@ class Inode:
 
         self.link_count: int = 1  # 硬链接计数 (用于删除文件/目录)
 
+        self.is_encrypted: bool = False  # 文件是否加密的标记
+
     def __repr__(self) -> str:
         return (
             f"Inode(id={self.id}, type='{self.type.name}', size={self.size}, "

@@ -4,7 +4,7 @@ from typing import List, Optional, Tuple
 
 from .datastructures import Inode, DirectoryEntry, Superblock, FileType, Permissions
 
-# 默认配置 (未来可以移到 config.py)
+# 默认配置
 DEFAULT_NUM_INODES = 1024
 DEFAULT_NUM_BLOCKS = 4096  # 4096个块
 DEFAULT_BLOCK_SIZE = 512  # 每个块512字节
@@ -225,12 +225,3 @@ class DiskManager:
         ):
             return None
         return self.inode_table[inode_id]
-
-    # --- 未来持久化相关方法 ---
-    # def save_disk_image(self, filename: str):
-    #     # ... 实现保存整个DiskManager状态到文件 ...
-    #     pass
-
-    # def load_disk_image(self, filename: str):
-    #     # ... 实现从文件加载DiskManager状态 ...
-    #     pass

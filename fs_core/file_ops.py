@@ -21,9 +21,17 @@ from .dir_ops import (
 
 from user_management.user_auth import UserAuthenticator
 
+from cryptography.fernet import Fernet
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+import base64
+import os
 
-# 默认新文件权限 (rw-r--r--)
+
+# 加密相关常量
+ENCRYPTION_SALT = b"file_system_salt"  # 实际部署时应使用随机生成的salt
 DEFAULT_FILE_PERMISSIONS = 0o644
+ENCRYPTION_ITERATIONS = 100000  # PBKDF2的迭代次数
 
 
 def create_file(
@@ -204,9 +212,6 @@ def delete_file(
     parent_inode.atime = current_timestamp
 
     return True, f"File '{file_name_to_delete}' deleted successfully."
-
-
-# --- 新增函数 ---
 
 
 def _parse_open_mode(mode_str: str) -> Optional[OpenMode]:
@@ -410,14 +415,30 @@ def close_file(auth: UserAuthenticator, fd: int) -> Tuple[bool, str]:
 def write_file(
     dm: DiskManager, auth: UserAuthenticator, fd: int, content_str: str
 ) -> Tuple[bool, str, Optional[int]]:
+    """
+    将内容写入指定文件。
+
+    参数:
+    - dm: 磁盘管理器实例，用于读写磁盘块。
+    - auth: 用户认证器实例，用于获取当前用户和文件访问权限。
+    - fd: 文件描述符，标识要写入的文件。
+    - content_str: 要写入文件的内容，为字符串形式。
+
+    返回:
+    - 成功时返回 (True, 成功消息, 实际写入的字节数)。
+    - 失败时返回 (False, 错误消息, 实际写入的字节数)。
+    """
+    # 获取当前用户
     current_user = auth.get_current_user()
     if not current_user:
         return False, "错误：无用户登录。", None
 
+    # 获取文件描述符对应的文件表项
     oft_entry = auth.get_oft_entry(fd)
     if oft_entry is None:
         return False, f"错误：无效的文件描述符 {fd}。", None
 
+    # 检查文件打开模式是否允许写入
     if oft_entry.mode not in [OpenMode.WRITE, OpenMode.APPEND, OpenMode.READ_WRITE]:
         return (
             False,
@@ -425,6 +446,7 @@ def write_file(
             None,
         )
 
+    # 将内容字符串编码为UTF-8字节流
     try:
         content_bytes = content_str.encode("utf-8")
     except UnicodeEncodeError as e:
@@ -434,6 +456,7 @@ def write_file(
     # if len_content_bytes == 0: # 写入空内容也是一种有效的写入，会截断文件
     #     pass # 继续执行，以便文件被截断（如果需要）
 
+    # 获取文件的inode引用和当前偏移量
     file_inode = oft_entry.inode_ref
     current_offset = oft_entry.offset  # 通常在“保存”操作前，这个offset会被重置为0
     block_size = dm.superblock.block_size
@@ -450,12 +473,11 @@ def write_file(
         physical_block_id: Optional[int] = None
         current_block_data: bytearray
 
+        # 检查逻辑块索引是否在文件已分配的块内
         if logical_block_idx < len(file_inode.data_block_indices):
             physical_block_id = file_inode.data_block_indices[logical_block_idx]
             try:
-                # 如果是从头覆盖写(offset_in_block=0)，并且这是该块的第一次写入，
-                # 则不需要读取旧数据，可以直接用新数据覆盖。
-                # 但为了通用性（部分覆盖），先读取。
+                # 如果是从头覆盖写(offset_in_block=0)，并且这是该块的第一次写入，不需要读取旧数据
                 current_block_data = dm.read_block(physical_block_id)
             except IndexError:
                 return (
@@ -470,6 +492,7 @@ def write_file(
                     f"内部错误：非连续逻辑块访问 (inode {file_inode.id})。",
                     bytes_written_this_call,
                 )
+            # 分配新的数据块
             physical_block_id = dm.allocate_data_block()
             if physical_block_id is None:
                 # 更新实际写入的字节和文件大小，即使磁盘满了
@@ -563,6 +586,51 @@ def write_file(
         f"{bytes_written_this_call} 字节成功写入 fd {fd}。",
         bytes_written_this_call,
     )
+
+
+def write_file_encrypted(
+    dm: DiskManager,
+    auth: UserAuthenticator,
+    fd: int,
+    content_str: str,
+    encryption_password: str = None,
+) -> Tuple[bool, str, Optional[int]]:
+    """
+    将加密内容写入指定文件。
+
+    参数:
+    - dm: 磁盘管理器实例
+    - auth: 用户认证器实例
+    - fd: 文件描述符
+    - content_str: 要写入的内容
+    - encryption_password: 加密密码，如果不提供则不加密
+
+    返回:
+    - Tuple[bool, str, Optional[int]]: (是否成功, 消息, 写入的字节数)
+    """
+    if encryption_password:
+        try:
+            # 生成加密密钥
+            key = _generate_encryption_key(encryption_password)
+            # 先将内容转换为bytes
+            content_bytes = content_str.encode("utf-8")
+            # 加密内容
+            encrypted_content = _encrypt_data(content_bytes, key)
+            # 将加密后的内容转换为字符串以便写入
+            content_str = base64.b64encode(encrypted_content).decode("utf-8")
+        except Exception as e:
+            return False, f"加密失败: {str(e)}", None
+
+    # 调用原始的write_file函数写入数据
+    success, msg, bytes_written = write_file(dm, auth, fd, content_str)
+
+    if success and encryption_password:
+        # 标记文件为加密文件（可以在inode中添加标记）
+        oft_entry = auth.get_oft_entry(fd)
+        if oft_entry and oft_entry.inode_ref:
+            oft_entry.inode_ref.is_encrypted = True
+
+    return success, msg, bytes_written
 
 
 def read_file(
@@ -691,6 +759,60 @@ def read_file(
     )
 
 
+def read_file_encrypted(
+    dm: DiskManager,
+    auth: UserAuthenticator,
+    fd: int,
+    num_bytes_to_read: int,
+    encryption_password: str = None,
+) -> Tuple[bool, str, Optional[bytes]]:
+    """
+    读取可能加密的文件内容。
+
+    参数:
+    - dm: DiskManager实例
+    - auth: UserAuthenticator实例
+    - fd: 文件描述符
+    - num_bytes_to_read: 要读取的字节数
+    - encryption_password: 如果文件加密，用于解密的密码
+
+    返回:
+    - Tuple[bool, str, Optional[bytes]]: (是否成功, 消息, 读取的内容)
+    """
+    # 首先检查文件是否加密
+    oft_entry = auth.get_oft_entry(fd)
+    if oft_entry is None:
+        return False, f"无效的文件描述符 {fd}", None
+
+    is_encrypted = getattr(oft_entry.inode_ref, "is_encrypted", False)
+
+    # 读取原始内容
+    success, msg, content = read_file(dm, auth, fd, num_bytes_to_read)
+
+    if not success or content is None:
+        return success, msg, content
+
+    # 如果文件加密但没有提供密码
+    if is_encrypted and not encryption_password:
+        return False, "文件已加密，需要提供密码", None
+
+    # 如果文件加密且提供了密码
+    if is_encrypted and encryption_password:
+        try:
+            # 生成解密密钥
+            key = _generate_encryption_key(encryption_password)
+            # 解码base64
+            encrypted_data = base64.b64decode(content)
+            # 解密内容
+            decrypted_content = _decrypt_data(encrypted_data, key)
+            return True, "成功读取并解密文件", decrypted_content
+        except Exception as e:
+            return False, f"解密失败: {str(e)}", None
+
+    # 文件未加密，直接返回内容
+    return success, msg, content
+
+
 def create_symbolic_link(
     dm: DiskManager,
     current_user_uid: int,
@@ -771,3 +893,33 @@ def create_symbolic_link(
         parent_inode.mtime = parent_inode.ctime = current_timestamp
 
     return True, f"符号链接 '{link_name}' -> '{target_path}' 创建成功。", new_inode_id
+
+
+def _generate_encryption_key(password: str) -> bytes:
+    """
+    使用PBKDF2生成加密密钥
+    """
+    kdf = PBKDF2HMAC(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=ENCRYPTION_SALT,
+        iterations=ENCRYPTION_ITERATIONS,
+    )
+    key = base64.urlsafe_b64encode(kdf.derive(password.encode()))
+    return key
+
+
+def _encrypt_data(data: bytes, key: bytes) -> bytes:
+    """
+    使用Fernet对数据进行加密
+    """
+    f = Fernet(key)
+    return f.encrypt(data)
+
+
+def _decrypt_data(encrypted_data: bytes, key: bytes) -> bytes:
+    """
+    使用Fernet对数据进行解密
+    """
+    f = Fernet(key)
+    return f.decrypt(encrypted_data)
